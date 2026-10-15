@@ -1,0 +1,22 @@
+# Tool settings for scripts/yarn_spark_settings.py.
+# The script runs on Python 3.6+ (old EMR images): the type hints use the typing module, and
+# `vermin --target=3.6- scripts/yarn_spark_settings.py` checks that nothing newer is used.
+
+[tool.ruff]
+line-length = 120
+target-version = "py37"  # the oldest version ruff knows; the script itself also runs on 3.6
+include = ["scripts/yarn_spark_settings.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP", "SIM"]
+ignore = [
+    "UP031",  # %-formatting is the style of the whole script; f-strings would only churn it
+    "UP022",  # capture_output= does not exist in Python 3.6, so keep stdout=/stderr=PIPE
+    "UP036",  # the "needs Python 3.6" check is deliberate: it gives a clear message on old Pythons
+]
+
+[tool.mypy]
+python_version = "3.10"  # the oldest version mypy checks; vermin covers 3.6
+files = ["scripts/yarn_spark_settings.py"]
+strict = true
+warn_return_any = false  # the REST API answers are JSON (Any) by nature
