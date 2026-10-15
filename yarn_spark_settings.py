@@ -29,7 +29,7 @@ wait for it (it takes a few seconds).
     aws s3 cp yarn_spark_settings.py s3://<bucket>/tools/
     aws emr add-steps --cluster-id j-XXXXXXXX --steps \\
       'Type=CUSTOM_JAR,Name=yarn-settings,ActionOnFailure=CONTINUE,Jar=command-runner.jar,Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_spark_settings.py - | python3 -"]'
-"""
+"""  # noqa: E501 - the EMR step command above must stay on one line to copy and paste it
 
 import argparse
 import datetime
@@ -47,6 +47,16 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, overload
+
+# Python 3.6 has no list[str] or "X | None" in annotations, so the hints use the typing module.
+Json = Dict[str, Any]  # one object from the ResourceManager or Spark REST API
+Live = Dict[str, Any]  # the live data: base, metrics, queues, tree, nodes, apps
+Balance = Dict[str, Any]  # the numbers of one queue's balance sheet (see queue_balance)
+User = Dict[str, Any]  # one user's numbers in a queue (see queue_balance and user_in)
+Why = Dict[str, Any]  # a plain explanation of one limit: title, what, calc, props, fix
+Check = Tuple[bool, str, Why]  # one check before an app starts: ok, short text, explanation
+Role = Union[None, str, Callable[[str], Optional[str]]]  # a colour role, or a function cell -> role
 
 WIDTH = 100
 EMR_INFO_DIR = os.environ.get("EMR_INFO_DIR", "/mnt/var/lib/info")
@@ -57,36 +67,49 @@ SECRET_NAME = re.compile(r"secret|password|passwd|\.pass$|credential|token$|acce
 
 # ================================================================== reading files
 
+
 class ConfigFile:
     """One config file: its path, its properties (or None) and a plain error message."""
 
-    def __init__(self, key, path, title):
+    def __init__(self, key: str, path: str, title: str) -> None:
         self.key, self.path, self.title = key, path, title
-        self.props, self.error = None, None
+        self.props: Optional[Dict[str, str]] = None
+        self.error: Optional[str] = None
+        self.option = ""  # the command-line option that sets the directory, for the error message
 
-    def get(self, name, default=None):
+    @overload
+    def get(self, name: str) -> Optional[str]: ...
+
+    @overload
+    def get(self, name: str, default: str) -> str: ...
+
+    def get(self, name: str, default: Optional[str] = None) -> Optional[str]:
         if not self.props:
             return default
         return self.props.get(name, default)
 
-    def has(self, name):
-        return bool(self.props) and name in self.props
+    def has(self, name: str) -> bool:
+        return self.props is not None and name in self.props
 
 
-def _open_error(path, title, e):
+def _open_error(path: str, title: str, e: OSError) -> str:
     """Turn an OSError from opening a config file into a message that says what to do."""
     if isinstance(e, FileNotFoundError):
-        return ("%s was not found at %s. If the config is somewhere else, set the directory with "
-                "the option shown below or the matching *_CONF_DIR variable." % (title, path))
+        return (
+            "%s was not found at %s. If the config is somewhere else, set the directory with "
+            "the option shown below or the matching *_CONF_DIR variable." % (title, path)
+        )
     if isinstance(e, PermissionError):
-        return ("No permission to read %s. Run the script as a user that can read it (on EMR, the "
-                "hadoop user or a user in the hadoop group), or ask an admin to make it readable." % path)
+        return (
+            "No permission to read %s. Run the script as a user that can read it (on EMR, the "
+            "hadoop user or a user in the hadoop group), or ask an admin to make it readable." % path
+        )
     if isinstance(e, IsADirectoryError):
         return "%s is a directory, not a file." % path
     return "Cannot read %s: %s." % (path, e.strerror or e)
 
 
-def read_hadoop_xml(cf):
+def read_hadoop_xml(cf: ConfigFile) -> None:
     """Fill cf.props from a Hadoop *-site.xml file, or set cf.error."""
     try:
         with open(cf.path, "rb") as f:
@@ -95,10 +118,12 @@ def read_hadoop_xml(cf):
         cf.error = _open_error(cf.path, cf.title, e)
         return
     except ET.ParseError as e:
-        cf.error = ("%s is not valid XML (%s). The file may be cut off or edited by hand; "
-                    "check it with: xmllint --noout %s" % (cf.path, e, cf.path))
+        cf.error = (
+            "%s is not valid XML (%s). The file may be cut off or edited by hand; "
+            "check it with: xmllint --noout %s" % (cf.path, e, cf.path)
+        )
         return
-    props = {}
+    props: Dict[str, str] = {}
     for prop in root.iter("property"):
         name = prop.findtext("name")
         if name is None:
@@ -107,7 +132,7 @@ def read_hadoop_xml(cf):
     cf.props = {k: expand_vars(v, props) for k, v in props.items()}
 
 
-def read_spark_defaults(cf):
+def read_spark_defaults(cf: ConfigFile) -> None:
     """Fill cf.props from spark-defaults.conf, or set cf.error."""
     try:
         with open(cf.path, encoding="utf-8", errors="replace") as f:
@@ -115,7 +140,7 @@ def read_spark_defaults(cf):
     except OSError as e:
         cf.error = _open_error(cf.path, cf.title, e)
         return
-    props = {}
+    props: Dict[str, str] = {}
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
@@ -126,12 +151,12 @@ def read_spark_defaults(cf):
     cf.props = props
 
 
-def expand_vars(value, props, depth=0):
+def expand_vars(value: str, props: Dict[str, str], depth: int = 0) -> str:
     """Expand ${name} with other properties or environment variables, like Hadoop does."""
     if depth > 10 or "${" not in value:
         return value
 
-    def repl(m):
+    def repl(m: "re.Match[str]") -> str:
         key = m.group(1)
         if key in props:
             return props[key]
@@ -141,14 +166,14 @@ def expand_vars(value, props, depth=0):
     return new if new == value else expand_vars(new, props, depth + 1)
 
 
-def first_dir(*candidates):
+def first_dir(*candidates: Optional[str]) -> str:
     for c in candidates:
         if c and os.path.isdir(c):
             return c
-    return candidates[-1]
+    return candidates[-1] or ""
 
 
-def read_json_file(path, denied):
+def read_json_file(path: str, denied: List[str]) -> Optional[Json]:
     """Return the parsed JSON file, or None. Add the path to denied when we may not read it."""
     try:
         with open(path) as f:
@@ -161,32 +186,38 @@ def read_json_file(path, denied):
     return data if isinstance(data, dict) else None
 
 
-def read_emr_info():
+def read_emr_info() -> Optional[Json]:
     """Return what EMR says about this cluster and this node, or None if this is not an EMR node."""
-    denied = []
+    denied: List[str] = []
     instance = read_json_file(os.path.join(EMR_INFO_DIR, "instance.json"), denied)
     job_flow = read_json_file(os.path.join(EMR_INFO_DIR, "job-flow.json"), denied)
     extra = read_json_file(os.path.join(EMR_INFO_DIR, "extraInstanceData.json"), denied)
-    if instance is None and job_flow is None:
-        if not denied:  # files are there but we may not read them: still an EMR node
-            return None
+    if instance is None and job_flow is None and not denied:  # (files we may not read: still an EMR node)
+        return None
     job_flow, extra, instance = job_flow or {}, extra or {}, instance or {}
-    groups = ["%s: %s x %s" % (g.get("instanceRole", "?").lower(), g.get("requestedInstanceCount", "?"),
-                               g.get("instanceType", "?")) for g in job_flow.get("instanceGroups") or []]
+    groups = [
+        "%s: %s x %s"
+        % (g.get("instanceRole", "?").lower(), g.get("requestedInstanceCount", "?"), g.get("instanceType", "?"))
+        for g in job_flow.get("instanceGroups") or []
+    ]
     return {
         "id": job_flow.get("jobFlowId", "?"),
         "release": extra.get("releaseLabel", ""),
         "groups": ", ".join(groups),
         "is_primary": instance.get("isMaster"),
-        "error": ("No permission to read the EMR cluster information in %s, so the cluster ID and node "
-                  "role are unknown. The rest of the report is not affected." % EMR_INFO_DIR)
-                 if denied else None,
+        "error": (
+            "No permission to read the EMR cluster information in %s, so the cluster ID and node "
+            "role are unknown. The rest of the report is not affected." % EMR_INFO_DIR
+        )
+        if denied
+        else None,
     }
 
 
 # ================================================================== helpers
 
-def to_mb(text):
+
+def to_mb(text: Any) -> Optional[int]:
     """Convert a Spark memory string (512m, 4g, 2048) to MB. Return None if unknown."""
     if text is None:
         return None
@@ -199,50 +230,81 @@ def to_mb(text):
     return int(num * factor)
 
 
-def to_float(text):
+def to_float(text: Any) -> Optional[float]:
     try:
         return float(text)
     except (TypeError, ValueError):
         return None
 
 
-def mb(n):
-    return "-" if n is None else "{:,} MB".format(int(n))
+def mb(n: Optional[float]) -> str:
+    return "-" if n is None else f"{int(n):,} MB"
 
 
-def pct(fraction):
+def pct(fraction: Optional[float]) -> str:
     return "-" if fraction is None else "%.0f%%" % (fraction * 100)
 
 
-def wrap(text, indent="", later=None):
+def wrap(text: str, indent: str = "", later: Optional[str] = None) -> str:
     later = indent if later is None else later
-    return textwrap.fill(text, width=WIDTH, initial_indent=indent, subsequent_indent=later,
-                         break_on_hyphens=False, break_long_words=False)
+    return textwrap.fill(
+        text,
+        width=WIDTH,
+        initial_indent=indent,
+        subsequent_indent=later,
+        break_on_hyphens=False,
+        break_long_words=False,
+    )
 
 
 # ================================================================== colour
 # Colour is added after wrapping and padding, so it never changes the layout. It is on only when
 # the output goes to a terminal (not to a file, a pipe or an EMR step log), unless --color says so.
 
-_SGR = {"bold": "1", "dim": "2", "under": "4", "red": "31", "green": "32", "yellow": "33",
-        "blue": "34", "magenta": "35", "cyan": "36"}
+_SGR = {
+    "bold": "1",
+    "dim": "2",
+    "under": "4",
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+}
 # What each part of the report looks like. Explanations keep the terminal's own text colour,
 # which reads well on dark and light themes.
 ROLES = {
-    "title": ("bold",), "section": ("bold", "blue"), "rule": ("dim",), "label": ("bold",),
-    "file": ("cyan",), "prop": ("magenta",), "value": ("bold",), "default": ("dim",),
-    "queue": ("bold",), "url": ("cyan", "under"),
-    "PROBLEM": ("bold", "red"), "WARNING": ("red",), "NOTE": ("blue",), "OK": ("green",),
-    "fix": ("bold", "green"), "error": ("bold", "red"), "good": ("green",), "bad": ("red",),
+    "title": ("bold",),
+    "section": ("bold", "blue"),
+    "rule": ("dim",),
+    "label": ("bold",),
+    "file": ("cyan",),
+    "prop": ("magenta",),
+    "value": ("bold",),
+    "default": ("dim",),
+    "queue": ("bold",),
+    "url": ("cyan", "under"),
+    "PROBLEM": ("bold", "red"),
+    "WARNING": ("red",),
+    "NOTE": ("blue",),
+    "OK": ("green",),
+    "fix": ("bold", "green"),
+    "error": ("bold", "red"),
+    "good": ("green",),
+    "bad": ("red",),
     # the frame around each group of sibling queues; groups next to each other get other colours
-    "group0": ("cyan",), "group1": ("yellow",), "group2": ("magenta",), "group3": ("green",),
+    "group0": ("cyan",),
+    "group1": ("yellow",),
+    "group2": ("magenta",),
+    "group3": ("green",),
     "group4": ("blue",),
 }
 GROUP_ROLES = ["group0", "group1", "group2", "group3", "group4"]
 COLOR = False
 
 
-def use_color(choice):
+def use_color(choice: str) -> None:
     """Decide once whether to colour the output: auto, always or never."""
     global COLOR
     if choice == "always" or (choice == "auto" and os.environ.get("FORCE_COLOR")):
@@ -253,7 +315,7 @@ def use_color(choice):
         COLOR = sys.stdout.isatty()
 
 
-def paint(text, role):
+def paint(text: str, role: Optional[str]) -> str:
     """Return text in the style of a role, or unchanged when colour is off."""
     if not COLOR or not text or role not in ROLES:
         return text
@@ -266,17 +328,18 @@ _TOKENS = re.compile(
     r"|(?P<file>(?<![\w.])(?:/[\w.\-]+)+/?|\b[\w.\-]+\.(?:xml|conf|json)\b)"
     r"|(?P<prop>\b(?:yarn|spark|oozie|hadoop|mapreduce|fs)\.[\w.\-]*\w)"
     r"|(?P<queue>\broot(?:\.[\w\-]+)+)"
-    r"|(?P<value>\b\d[\d,]*(?:\.\d+)? MB\b)")
+    r"|(?P<value>\b\d[\d,]*(?:\.\d+)? MB\b)"
+)
 
 
-def highlight(text):
+def highlight(text: str) -> str:
     """Colour the file names, property names, queues and MB values inside a text."""
     if not COLOR:
         return text
     return _TOKENS.sub(lambda m: paint(m.group(0), m.lastgroup), text)
 
 
-def section(title, note=""):
+def section(title: str, note: str = "") -> None:
     print()
     print(paint(title.upper(), "section"))
     print(paint("-" * len(title), "rule"))
@@ -285,21 +348,27 @@ def section(title, note=""):
         print()
 
 
-def _box_chars():
+def _box_chars() -> Tuple[Dict[str, str], str, str]:
     """Frame characters and the separator dot: box drawing when the terminal can show them, else plain ASCII."""
     try:
         "┌─│└✓✗−◀·•".encode(sys.stdout.encoding or "ascii")
-        return ({"top": "┌", "line": "─", "side": "│", "bottom": "└", "no": "✗", "minus": "−", "arrow": "◀",
-                 "bullet": "•"}, "✓", "·")
+        return (
+            {"top": "┌", "line": "─", "side": "│", "bottom": "└", "no": "✗", "minus": "−", "arrow": "◀", "bullet": "•"},
+            "✓",
+            "·",
+        )
     except (UnicodeEncodeError, LookupError):
-        return ({"top": "+", "line": "-", "side": "|", "bottom": "+", "no": "X", "minus": "-", "arrow": "<",
-                 "bullet": "*"}, "OK", "-")
+        return (
+            {"top": "+", "line": "-", "side": "|", "bottom": "+", "no": "X", "minus": "-", "arrow": "<", "bullet": "*"},
+            "OK",
+            "-",
+        )
 
 
 BOX, MARK_OK, DOT = _box_chars()
 
 
-def column_widths(headers, rows):
+def column_widths(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[int]:
     widths = [len(h) for h in headers]
     for r in rows:
         for i, c in enumerate(r):
@@ -307,17 +376,19 @@ def column_widths(headers, rows):
     return widths
 
 
-def table_row(cells, widths, roles):
+def table_row(cells: Sequence[Any], widths: Sequence[int], roles: Sequence[Role]) -> str:
     """One aligned table line, without the indent. roles: one role (or a function cell -> role) per column."""
     out = []
-    for text, width, role in zip(cells, widths, roles):
-        text = str(text)
-        role = role(text) if callable(role) else role
-        out.append(paint(text, role) + " " * (width - len(text)))
+    for cell, width, role in zip(cells, widths, roles):
+        text = str(cell)
+        name = role(text) if callable(role) else role
+        out.append(paint(text, name) + " " * (width - len(text)))
     return "  ".join(out)
 
 
-def table(headers, rows, indent="  ", roles=None):
+def table(
+    headers: Sequence[str], rows: Sequence[Sequence[Any]], indent: str = "  ", roles: Optional[Sequence[Role]] = None
+) -> None:
     """Print an aligned table. roles: one role (or a function cell -> role) per column."""
     widths = column_widths(headers, rows)
     print((indent + table_row(headers, widths, ["label"] * len(headers))).rstrip())
@@ -328,18 +399,19 @@ def table(headers, rows, indent="  ", roles=None):
 
 # ================================================================== the ResourceManager
 
-def rm_urls(yarn, given):
+
+def rm_urls(yarn: ConfigFile, given: Optional[str]) -> List[str]:
     """Return the ResourceManager web addresses to try, in order."""
     if given:
         url = given.rstrip("/")
         return [url if "://" in url else "http://" + url]
-    https = yarn.get("yarn.http.policy", "HTTP_ONLY").upper() == "HTTPS_ONLY"
+    https = (yarn.get("yarn.http.policy") or "HTTP_ONLY").upper() == "HTTPS_ONLY"
     key = "yarn.resourcemanager.webapp.https.address" if https else "yarn.resourcemanager.webapp.address"
     port = "8090" if https else "8088"
     scheme = "https://" if https else "http://"
-    addrs = []
-    ids = [i.strip() for i in yarn.get("yarn.resourcemanager.ha.rm-ids", "").split(",") if i.strip()]
-    if yarn.get("yarn.resourcemanager.ha.enabled", "false").lower() == "true" and ids:
+    addrs: List[str] = []
+    ids = [i.strip() for i in (yarn.get("yarn.resourcemanager.ha.rm-ids") or "").split(",") if i.strip()]
+    if (yarn.get("yarn.resourcemanager.ha.enabled") or "false").lower() == "true" and ids:
         for rm_id in ids:
             addr = yarn.get("%s.%s" % (key, rm_id))
             if not addr and yarn.get("yarn.resourcemanager.hostname.%s" % rm_id):
@@ -350,7 +422,8 @@ def rm_urls(yarn, given):
     if addr and not addr.startswith("0.0.0.0"):
         addrs.append(addr)
     addrs.append("%s:%s" % (yarn.get("yarn.resourcemanager.hostname", "localhost"), port))
-    seen, result = set(), []
+    seen: Set[str] = set()
+    result: List[str] = []
     for a in addrs:
         if a not in seen:
             seen.add(a)
@@ -366,26 +439,43 @@ class RMError(Exception):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _curl_negotiate(url):
+def _curl_negotiate(url: str) -> bytes:
     """GET with curl --negotiate (Kerberos/SPNEGO). Return the parsed JSON, or raise RMError."""
     try:
         out = subprocess.run(
-            ["curl", "-sS", "--fail", "--noproxy", "*", "--negotiate", "-u", ":",
-             "-H", "Accept: application/json", url],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            [
+                "curl",
+                "-sS",
+                "--fail",
+                "--noproxy",
+                "*",
+                "--negotiate",
+                "-u",
+                ":",
+                "-H",
+                "Accept: application/json",
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
     except FileNotFoundError:
-        raise RMError("The ResourceManager asks for Kerberos login (HTTP 401), and curl is not "
-                      "installed to log in with Kerberos. Install curl, run kinit, and try again.")
+        raise RMError(
+            "The ResourceManager asks for Kerberos login (HTTP 401), and curl is not "
+            "installed to log in with Kerberos. Install curl, run kinit, and try again."
+        ) from None
     except subprocess.TimeoutExpired:
-        raise RMError("The Kerberos login with curl did not answer within 20 seconds.")
+        raise RMError("The Kerberos login with curl did not answer within 20 seconds.") from None
     if out.returncode != 0:
-        raise RMError("The ResourceManager asks for Kerberos login (HTTP 401) and the login failed "
-                      "(%s). Run kinit (check with klist) and try again."
-                      % out.stderr.decode("utf-8", "replace").strip())
+        raise RMError(
+            "The ResourceManager asks for Kerberos login (HTTP 401) and the login failed "
+            "(%s). Run kinit (check with klist) and try again." % out.stderr.decode("utf-8", "replace").strip()
+        )
     return out.stdout
 
 
-def get_json(url, timeout=15):
+def get_json(url: str, timeout: float = 15) -> Any:
     """GET a JSON document (read-only). Raise RMError with a plain message on failure."""
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
@@ -395,43 +485,54 @@ def get_json(url, timeout=15):
         if e.code == 401:
             body = _curl_negotiate(url)
         elif e.code == 403:
-            raise RMError("The ResourceManager refused access (HTTP 403). The user running the script "
-                          "has no permission to read the REST API (yarn.admin.acl or the web UI ACLs).")
+            raise RMError(
+                "The ResourceManager refused access (HTTP 403). The user running the script "
+                "has no permission to read the REST API (yarn.admin.acl or the web UI ACLs)."
+            ) from None
         elif e.code == 404:
-            raise RMError("HTTP 404 for %s. The address may not be a ResourceManager web address "
-                          "(port 8088, or 8090 with HTTPS)." % url)
+            raise RMError(
+                "HTTP 404 for %s. The address may not be a ResourceManager web address "
+                "(port 8088, or 8090 with HTTPS)." % url
+            ) from None
         else:
-            raise RMError("The ResourceManager answered HTTP %s %s." % (e.code, e.reason))
+            raise RMError("The ResourceManager answered HTTP %s %s." % (e.code, e.reason)) from None
     except urllib.error.URLError as e:
         reason = e.reason
         if isinstance(reason, ConnectionRefusedError):
-            raise RMError("Connection refused. Nothing listens on that host and port: the ResourceManager "
-                          "may be down, or the port is wrong (8088, or 8090 with HTTPS).")
+            raise RMError(
+                "Connection refused. Nothing listens on that host and port: the ResourceManager "
+                "may be down, or the port is wrong (8088, or 8090 with HTTPS)."
+            ) from None
         if isinstance(reason, socket.gaierror):
-            raise RMError("Unknown host name. Check the host in --rm or in yarn-site.xml "
-                          "(yarn.resourcemanager.hostname).")
+            raise RMError(
+                "Unknown host name. Check the host in --rm or in yarn-site.xml (yarn.resourcemanager.hostname)."
+            ) from None
         if isinstance(reason, (socket.timeout, TimeoutError)):
-            raise RMError("No answer within 15 seconds. A firewall or security group probably blocks the "
-                          "port. On EMR, allow this host on port 8088 in the primary node's security group.")
+            raise RMError(
+                "No answer within 15 seconds. A firewall or security group probably blocks the "
+                "port. On EMR, allow this host on port 8088 in the primary node's security group."
+            ) from None
         if isinstance(reason, ssl.SSLError):
-            raise RMError("HTTPS failed (%s). The ResourceManager certificate may not be trusted by this "
-                          "host." % reason)
-        raise RMError("Cannot connect: %s." % reason)
+            raise RMError(
+                "HTTPS failed (%s). The ResourceManager certificate may not be trusted by this host." % reason
+            ) from None
+        raise RMError("Cannot connect: %s." % reason) from None
     except (socket.timeout, TimeoutError):
-        raise RMError("The ResourceManager stopped answering after 15 seconds.")
+        raise RMError("The ResourceManager stopped answering after 15 seconds.") from None
     except (http.client.HTTPException, ConnectionError) as e:
-        raise RMError("The connection broke: %s." % e)
+        raise RMError("The connection broke: %s." % e) from None
     try:
         return json.loads(body.decode("utf-8"))
     except ValueError:
         text = body.decode("utf-8", "replace")
         if "standby" in text.lower():
-            raise RMError("This ResourceManager is the standby one. Give the active one with --rm.")
-        raise RMError("The answer is not JSON. The address may point to another web server, or to a "
-                      "login page of a proxy.")
+            raise RMError("This ResourceManager is the standby one. Give the active one with --rm.") from None
+        raise RMError(
+            "The answer is not JSON. The address may point to another web server, or to a login page of a proxy."
+        ) from None
 
 
-def walk_rm_tree(q, path, out):
+def walk_rm_tree(q: Json, path: str, out: Dict[str, Json]) -> None:
     """Every queue of the live data, parents too: path -> the queue from the REST API."""
     path = q.get("queuePath") or path
     out[path] = q
@@ -442,9 +543,9 @@ def walk_rm_tree(q, path, out):
         walk_rm_tree(c, "%s.%s" % (path, c.get("queueName", "?")), out)
 
 
-def fetch_live(bases):
+def fetch_live(bases: Iterable[str]) -> Tuple[Optional[Live], List[str]]:
     """Return the live data from the first ResourceManager that answers, plus the errors on the way."""
-    errors = []
+    errors: List[str] = []
     for base in bases:
         try:
             metrics = get_json(base + "/ws/v1/cluster/metrics")["clusterMetrics"]
@@ -452,12 +553,14 @@ def fetch_live(bases):
             nodes = (get_json(base + "/ws/v1/cluster/nodes").get("nodes") or {}).get("node") or []
             if isinstance(nodes, dict):  # one node sent as an object
                 nodes = [nodes]
-            tree = {}
+            tree: Dict[str, Json] = {}
             if sched.get("type") == "capacityScheduler":
                 walk_rm_tree(sched, "root", tree)
             else:
-                errors.append("%s: the scheduler is %s, not the Capacity Scheduler. The queue data is "
-                              "skipped." % (base, sched.get("type", "unknown")))
+                errors.append(
+                    "%s: the scheduler is %s, not the Capacity Scheduler. The queue data is "
+                    "skipped." % (base, sched.get("type", "unknown"))
+                )
             queues = {p: q for p, q in tree.items() if not (q.get("queues") or {}).get("queue")}  # leaves
         except RMError as e:
             errors.append("%s: %s" % (base, e))
@@ -466,15 +569,14 @@ def fetch_live(bases):
             errors.append("%s: the answer does not look like the ResourceManager REST API." % base)
             continue
         apps = fetch_apps(base, errors)
-        return {"base": base, "metrics": metrics, "queues": queues, "tree": tree, "nodes": nodes,
-                "apps": apps}, errors
+        return {"base": base, "metrics": metrics, "queues": queues, "tree": tree, "nodes": nodes, "apps": apps}, errors
     return None, errors
 
 
 SPARK_STAGE_LOOKUPS = 20  # ask the Spark UI of at most this many running Spark apps
 
 
-def fetch_apps(base, errors):
+def fetch_apps(base: str, errors: List[str]) -> Optional[List[Json]]:
     """Running and waiting apps, each with what it does now. None if the list cannot be read."""
     try:
         data = get_json(base + "/ws/v1/cluster/apps?states=RUNNING,ACCEPTED")
@@ -484,8 +586,9 @@ def fetch_apps(base, errors):
         return None
     if isinstance(apps, dict):  # one app sent as an object
         apps = [apps]
-    spark_running = [a for a in apps if a.get("state") == "RUNNING"
-                     and str(a.get("applicationType", "")).upper() == "SPARK"]
+    spark_running = [
+        a for a in apps if a.get("state") == "RUNNING" and str(a.get("applicationType", "")).upper() == "SPARK"
+    ]
     for a in spark_running[:SPARK_STAGE_LOOKUPS]:
         a["_stages"] = spark_stages(base, a.get("id", ""))
         if waiting_tasks(a) and not pending_request(a)[0]:
@@ -493,7 +596,7 @@ def fetch_apps(base, errors):
     return apps
 
 
-def spark_limits(base, app_id):
+def spark_limits(base: str, app_id: str) -> Optional[Dict[str, str]]:
     """The executor limits that a running Spark app uses, from its UI. None if the UI does not answer."""
     url = "%s/proxy/%s/api/v1/applications/%s/environment" % (base, app_id, app_id)
     try:
@@ -505,10 +608,10 @@ def spark_limits(base, app_id):
     return {k: props[k] for k in keys if k in props}
 
 
-def pending_request(app):
+def pending_request(app: Json) -> Tuple[int, Optional[int]]:
     """What a running app asks YARN for and does not have yet: (containers, MB each).
     (0, None) when it asks for nothing."""
-    count, size = 0, None
+    count, size = 0, None  # type: int, Optional[int]
     for r in app.get("resourceRequests") or []:
         if r.get("resourceName", "*") != "*":  # host and rack requests repeat the "*" one
             continue
@@ -517,20 +620,22 @@ def pending_request(app):
             count += n
             size = max(size or 0, int(to_float((r.get("capability") or {}).get("memory")) or 0)) or None
     if not count:  # Hadoop 3 also gives the pending memory per partition
-        for part in ((app.get("resourceInfo") or {}).get("resourceUsagesByPartition") or []):
+        for part in (app.get("resourceInfo") or {}).get("resourceUsagesByPartition") or []:
             pend = int(to_float((part.get("pending") or {}).get("memory")) or 0)
             if pend > 0:
                 return -1, pend  # -1: the number of containers is unknown, pend is the total MB
     return count, size
 
 
-def waiting_tasks(app):
+def waiting_tasks(app: Json) -> int:
     """Tasks of the active Spark stages that wait for a free executor core."""
-    return sum(max(0, int(st.get("numTasks", 0)) - int(st.get("numCompleteTasks", 0))
-                   - int(st.get("numActiveTasks", 0))) for st in app.get("_stages") or [])
+    return sum(
+        max(0, int(st.get("numTasks", 0)) - int(st.get("numCompleteTasks", 0)) - int(st.get("numActiveTasks", 0)))
+        for st in app.get("_stages") or []
+    )
 
 
-def spark_stages(base, app_id):
+def spark_stages(base: str, app_id: str) -> Optional[List[Json]]:
     """The active stages of a running Spark app, from its UI through the ResourceManager proxy.
     None if the UI does not answer (for example a driver on a host that the proxy cannot reach)."""
     url = "%s/proxy/%s/api/v1/applications/%s/stages?status=active" % (base, app_id, app_id)
@@ -543,45 +648,49 @@ def spark_stages(base, app_id):
 
 # ================================================================== the model
 
+
 class Queue:
-    def __init__(self, path):
+    def __init__(self, path: str) -> None:
         self.path = path
-        self.abs_cap = self.abs_max = None    # share of the cluster, 0..1
-        self.ulf = 1.0                        # user-limit-factor
-        self.min_user_pct = 100.0             # minimum-user-limit-percent
-        self.am_pct = None                    # maximum-am-resource-percent, 0..1
+        self.abs_cap: Optional[float] = None  # guaranteed share of the cluster, 0..1
+        self.abs_max: Optional[float] = None  # maximum share of the cluster, 0..1
+        self.ulf = 1.0  # user-limit-factor
+        self.min_user_pct = 100.0  # minimum-user-limit-percent
+        self.am_pct: Optional[float] = None  # maximum-am-resource-percent, 0..1
         self.state = "RUNNING"
-        self.max_alloc_mb = None
-        self.ordering = None                  # ordering-policy: fifo (default) or fair
-        self.live = None                      # the queue from the REST API
+        self.max_alloc_mb: Optional[float] = None
+        self.ordering: Optional[str] = None  # ordering-policy: fifo (default) or fair
+        self.live: Optional[Json] = None  # the queue from the REST API
 
     @property
-    def one_user_max(self):
+    def one_user_max(self) -> Optional[float]:
         if self.abs_cap is None or self.abs_max is None:
             return None
         if self.ulf <= 0:  # -1 means no user limit (Hadoop 3.3+)
             return self.abs_max
         return min(self.ulf * self.abs_cap, self.abs_max)
 
-    def live_mb(self, key):
+    def live_mb(self, key: str) -> Optional[float]:
         if not self.live:
             return None
         return (self.live.get(key) or {}).get("memory")
 
 
-def build_queues(cs, live):
+def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
     """Leaf queues from capacity-scheduler.xml, completed (or replaced) by the live data."""
-    queues = {}
+    queues: Dict[str, Queue] = {}
     global_am = to_float(cs.get("yarn.scheduler.capacity.maximum-am-resource-percent", "0.1"))
 
-    def walk(path, abs_cap, abs_max):
+    def walk(path: str, abs_cap: Optional[float], abs_max: Optional[float]) -> None:
         children = cs.get("yarn.scheduler.capacity.%s.queues" % path)
         if children:
             names = [c.strip() for c in children.split(",") if c.strip()]
             raws = [(cs.get("yarn.scheduler.capacity.%s.%s.capacity" % (path, n)) or "").strip() for n in names]
             weights = [to_float(r[:-1]) if r.lower().endswith("w") else None for r in raws]
-            if weights and None not in weights:  # weights (2w, 1w): each child gets weight / sum
-                caps = [w * 100.0 / (sum(weights) or 1.0) for w in weights]
+            caps: List[Optional[float]]
+            known = [w for w in weights if w is not None]
+            if weights and len(known) == len(weights):  # weights (2w, 1w): each child gets weight / sum
+                caps = [w * 100.0 / (sum(known) or 1.0) for w in known]
             else:
                 caps = [to_float(r) for r in raws]
             for child, cap in zip(names, caps):
@@ -589,9 +698,11 @@ def build_queues(cs, live):
                 maxcap = to_float(cs.get("yarn.scheduler.capacity.%s.maximum-capacity" % p, "100"))
                 if maxcap is not None and maxcap < 0:  # -1 means 100
                     maxcap = 100.0
-                walk(p,
-                     abs_cap * cap / 100.0 if (abs_cap is not None and cap is not None) else None,
-                     abs_max * maxcap / 100.0 if (abs_max is not None and maxcap is not None) else None)
+                walk(
+                    p,
+                    abs_cap * cap / 100.0 if (abs_cap is not None and cap is not None) else None,
+                    abs_max * maxcap / 100.0 if (abs_max is not None and maxcap is not None) else None,
+                )
             return
         q = Queue(path)
         q.abs_cap, q.abs_max = abs_cap, abs_max
@@ -622,7 +733,7 @@ def build_queues(cs, live):
     return queues
 
 
-def find_queue(queues, name):
+def find_queue(queues: Dict[str, Queue], name: str) -> Optional[Queue]:
     """Find the leaf queue that an app or launcher names ("default" or "root.default")."""
     if name in queues:
         return queues[name]
@@ -633,7 +744,18 @@ def find_queue(queues, name):
 
 
 class Container:
-    def __init__(self, name, heap, heap_note, overhead, overhead_note, other, other_note, vcores, min_alloc):
+    def __init__(
+        self,
+        name: str,
+        heap: int,
+        heap_note: str,
+        overhead: int,
+        overhead_note: str,
+        other: int,
+        other_note: str,
+        vcores: int,
+        min_alloc: float,
+    ) -> None:
         self.name, self.heap, self.heap_note = name, heap, heap_note
         self.overhead, self.overhead_note = overhead, overhead_note
         self.other, self.other_note, self.vcores = other, other_note, vcores
@@ -642,11 +764,11 @@ class Container:
         self.size = int(math.ceil(self.total / float(min_alloc)) * min_alloc)
 
 
-def spark_containers(spark, min_alloc):
+def spark_containers(spark: ConfigFile, min_alloc: float) -> Tuple[Container, Container, str]:
     """What one Spark app asks YARN for: (executor, AM, deploy mode)."""
     deploy = spark.get("spark.submit.deployMode", "client")
 
-    def overhead(key, factor_key, heap):
+    def overhead(key: str, factor_key: Optional[str], heap: int) -> Tuple[int, str]:
         if spark.get(key):
             return to_mb(spark.get(key)) or 0, "set (%s)" % key
         factor = (to_float(spark.get(factor_key, "0.10")) or 0.10) if factor_key else 0.10
@@ -654,14 +776,13 @@ def spark_containers(spark, min_alloc):
 
     # Executor. On EMR, spark.emr.default.executor.* apply when spark.executor.* are not set.
     if spark.get("spark.executor.memory"):
-        heap, note = to_mb(spark.get("spark.executor.memory")), "spark.executor.memory"
+        heap, note = to_mb(spark.get("spark.executor.memory")) or 1024, "spark.executor.memory"
     elif spark.get("spark.emr.default.executor.memory"):
-        heap, note = to_mb(spark.get("spark.emr.default.executor.memory")), "EMR default for the instance type"
+        heap, note = to_mb(spark.get("spark.emr.default.executor.memory")) or 1024, "EMR default for the instance type"
     else:
         heap, note = 1024, "Spark default"
-    heap = heap or 1024
     ovh, ovh_note = overhead("spark.executor.memoryOverhead", "spark.executor.memoryOverheadFactor", heap)
-    other, other_notes = 0, []
+    other, other_notes = 0, []  # type: int, List[str]
     if spark.get("spark.executor.pyspark.memory"):
         other += to_mb(spark.get("spark.executor.pyspark.memory")) or 0
         other_notes.append("Python workers")
@@ -676,8 +797,9 @@ def spark_containers(spark, min_alloc):
         heap = to_mb(spark.get("spark.driver.memory", "1g")) or 1024
         ovh, ovh_note = overhead("spark.driver.memoryOverhead", "spark.driver.memoryOverheadFactor", heap)
         cores = int(to_float(spark.get("spark.driver.cores")) or 1)
-        am = Container("ApplicationMaster (holds the driver)", heap, "spark.driver.memory",
-                       ovh, ovh_note, 0, "", cores, min_alloc)
+        am = Container(
+            "ApplicationMaster (holds the driver)", heap, "spark.driver.memory", ovh, ovh_note, 0, "", cores, min_alloc
+        )
     else:
         heap = to_mb(spark.get("spark.yarn.am.memory", "512m")) or 512
         # In client mode Spark uses a fixed factor of 0.10 for the AM, not spark.driver.memoryOverheadFactor
@@ -689,17 +811,27 @@ def spark_containers(spark, min_alloc):
 
 # ================================================================== findings
 
-class Finding:
-    ORDER = {"PROBLEM": 0, "WARNING": 1, "NOTE": 2, "OK": 3}
 
-    def __init__(self, level, title, text, fix=None):
+class Finding:
+    ORDER: Dict[str, int] = {"PROBLEM": 0, "WARNING": 1, "NOTE": 2, "OK": 3}
+
+    def __init__(self, level: str, title: str, text: str, fix: Optional[str] = None) -> None:
         self.level, self.title, self.text, self.fix = level, title, text, fix
 
 
-def find_problems(files, queues, live, executor, am, deploy):
+def find_problems(
+    files: Dict[str, ConfigFile],
+    queues: Dict[str, Queue],
+    live: Optional[Live],
+    executor: Container,
+    am: Container,
+    deploy: str,
+) -> List[Finding]:
     yarn, cs, spark, oozie = files["yarn"], files["cs"], files["spark"], files["oozie"]
-    out = []
-    add = lambda *a: out.append(Finding(*a))  # noqa: E731
+    out: List[Finding] = []
+
+    def add(level: str, title: str, text: str, fix: Optional[str] = None) -> None:
+        out.append(Finding(level, title, text, fix))
 
     max_alloc = to_float(yarn.get("yarn.scheduler.maximum-allocation-mb", "8192")) or 8192
     max_vcores = to_float(yarn.get("yarn.scheduler.maximum-allocation-vcores", "4")) or 4
@@ -707,47 +839,73 @@ def find_problems(files, queues, live, executor, am, deploy):
     queue_name = spark.get("spark.yarn.queue", "default")
     q = find_queue(queues, queue_name) if queues else None
     nodes = [n for n in (live or {}).get("nodes", []) if n.get("state") == "RUNNING"]
-    who = "client mode: a small AM; the driver runs where you start spark-submit" if deploy != "cluster" \
+    who = (
+        "client mode: a small AM; the driver runs where you start spark-submit"
+        if deploy != "cluster"
         else "cluster mode: the driver runs inside the AM"
+    )
 
     # ---- the queue that Spark uses
     if queues and q is None:
-        add("PROBLEM", "Spark's queue \"%s\" does not exist" % queue_name,
-            "spark-defaults.conf sends apps to queue \"%s\" (spark.yarn.queue), but there is no such leaf "
-            "queue. Apps are rejected at submit unless spark-submit gives another queue with --queue."
-            % queue_name,
-            "Set spark.yarn.queue to one of: %s." % ", ".join(sorted(queues)))
+        add(
+            "PROBLEM",
+            'Spark\'s queue "%s" does not exist' % queue_name,
+            'spark-defaults.conf sends apps to queue "%s" (spark.yarn.queue), but there is no such leaf '
+            "queue. Apps are rejected at submit unless spark-submit gives another queue with --queue." % queue_name,
+            "Set spark.yarn.queue to one of: %s." % ", ".join(sorted(queues)),
+        )
     if q is not None and q.state != "RUNNING":
-        add("PROBLEM", "Queue %s is %s" % (q.path, q.state),
+        add(
+            "PROBLEM",
+            "Queue %s is %s" % (q.path, q.state),
             "A stopped queue accepts no new apps. Spark apps sent to it are rejected.",
-            "Set yarn.scheduler.capacity.%s.state to RUNNING and refresh the queues." % q.path)
+            "Set yarn.scheduler.capacity.%s.state to RUNNING and refresh the queues." % q.path,
+        )
 
     # ---- one container must fit under YARN's per-container limit
     limit = q.max_alloc_mb if (q is not None and q.max_alloc_mb) else max_alloc
-    limit_name = ("yarn.scheduler.capacity.%s.maximum-allocation-mb" % q.path
-                  if (q is not None and q.max_alloc_mb) else "yarn.scheduler.maximum-allocation-mb")
+    limit_name = (
+        "yarn.scheduler.capacity.%s.maximum-allocation-mb" % q.path
+        if (q is not None and q.max_alloc_mb)
+        else "yarn.scheduler.maximum-allocation-mb"
+    )
     # Without spark-defaults.conf the sizes are only Spark's defaults; without yarn-site.xml the
     # limits are only YARN's defaults. Then the checks would say nothing about this cluster.
     sizes_known = spark.props is not None
     too_big = [c for c in (executor, am) if c.total > limit] if (sizes_known and yarn.props is not None) else []
     for c in too_big:
-        add("PROBLEM", "The %s container is bigger than YARN allows" % c.name.split(" (")[0].lower(),
+        add(
+            "PROBLEM",
+            "The %s container is bigger than YARN allows" % c.name.split(" (")[0].lower(),
             "It needs %s (heap %s + overhead %s%s), but the largest container YARN gives is %s (%s). "
-            "spark-submit stops at once with \"Required ... memory ... is above the max threshold\"."
-            % (mb(c.total), mb(c.heap), mb(c.overhead), " + %s" % mb(c.other) if c.other else "",
-               mb(limit), limit_name),
-            "Make the container smaller (%s or its overhead), or raise %s." % (c.heap_note, limit_name))
+            'spark-submit stops at once with "Required ... memory ... is above the max threshold".'
+            % (
+                mb(c.total),
+                mb(c.heap),
+                mb(c.overhead),
+                " + %s" % mb(c.other) if c.other else "",
+                mb(limit),
+                limit_name,
+            ),
+            "Make the container smaller (%s or its overhead), or raise %s." % (c.heap_note, limit_name),
+        )
     if sizes_known and yarn.props is not None and not too_big:
-        add("OK", "Each Spark container fits under YARN's per-container limit",
+        add(
+            "OK",
+            "Each Spark container fits under YARN's per-container limit",
             "Executor %s and ApplicationMaster %s; the limit is %s (%s)."
-            % (mb(executor.total), mb(am.total), mb(limit), limit_name))
+            % (mb(executor.total), mb(am.total), mb(limit), limit_name),
+        )
     if uses_vcores and sizes_known and yarn.props is not None:
         for c in (executor, am):
             if c.vcores > max_vcores:
-                add("PROBLEM", "The %s asks for more vcores than YARN allows" % c.name.lower(),
+                add(
+                    "PROBLEM",
+                    "The %s asks for more vcores than YARN allows" % c.name.lower(),
                     "It asks for %d vcores; the most for one container is %d "
                     "(yarn.scheduler.maximum-allocation-vcores). spark-submit fails." % (c.vcores, max_vcores),
-                    "Lower the cores (spark.executor.cores / spark.driver.cores), or raise the limit.")
+                    "Lower the cores (spark.executor.cores / spark.driver.cores), or raise the limit.",
+                )
 
     # ---- an executor must fit on a node
     if nodes:
@@ -759,65 +917,91 @@ def find_problems(files, queues, live, executor, am, deploy):
     if node_mb and sizes_known:
         per_node = int(node_mb // executor.size)
         if per_node == 0:
-            add("PROBLEM", "No node is big enough for one executor",
+            add(
+                "PROBLEM",
+                "No node is big enough for one executor",
                 "An executor takes %s in YARN, but a node gives YARN only %s (%s). YARN accepts the "
                 "app, but its executors never start." % (mb(executor.size), mb(node_mb), node_src),
-                "Make executors smaller (spark.executor.memory), or use bigger instance types.")
+                "Make executors smaller (spark.executor.memory), or use bigger instance types.",
+            )
         else:
-            text = ("A node gives YARN %s (%s) and an executor takes %s, so a node holds %d executor%s."
-                    % (mb(node_mb), node_src, mb(executor.size), per_node, "" if per_node == 1 else "s"))
+            text = "A node gives YARN %s (%s) and an executor takes %s, so a node holds %d executor%s." % (
+                mb(node_mb),
+                node_src,
+                mb(executor.size),
+                per_node,
+                "" if per_node == 1 else "s",
+            )
             if nodes:
                 text += " The %d running nodes hold about %d executors in all, when nothing else runs." % (
-                    len(nodes), sum(int(s // executor.size) for s in sizes))
+                    len(nodes),
+                    sum(int(s // executor.size) for s in sizes),
+                )
             add("OK", "Executors fit on the nodes", text)
-    if nodes:
+    if nodes and live:
         free = max(n.get("availMemoryMB") or 0 for n in nodes)
         apps = (live["metrics"].get("appsRunning") or 0) + (live["metrics"].get("appsPending") or 0)
         if free < executor.size and apps:
-            add("WARNING", "Right now no node has room for another executor",
+            add(
+                "WARNING",
+                "Right now no node has room for another executor",
                 "The most free memory on one node is %s; an executor needs %s. New executors wait "
                 "until running containers end." % (mb(free), mb(executor.size)),
-                "Wait, add nodes (or turn on managed scaling), or make executors smaller.")
+                "Wait, add nodes (or turn on managed scaling), or make executors smaller.",
+            )
     bad = [n for n in (live or {}).get("nodes", []) if n.get("state") not in ("RUNNING", "DECOMMISSIONED")]
     if bad:
-        add("WARNING", "%d node%s not usable" % (len(bad), " is" if len(bad) == 1 else "s are"),
-            ", ".join("%s (%s)" % (n.get("nodeHostName"), n.get("state")) for n in bad) +
-            ". YARN does not start containers on these nodes.",
-            "Check the NodeManager log and disk space on those nodes.")
+        add(
+            "WARNING",
+            "%d node%s not usable" % (len(bad), " is" if len(bad) == 1 else "s are"),
+            ", ".join("%s (%s)" % (n.get("nodeHostName"), n.get("state")) for n in bad)
+            + ". YARN does not start containers on these nodes.",
+            "Check the NodeManager log and disk space on those nodes.",
+        )
 
     # ---- the AM pool of Spark's queue
     if q is not None:
         am_limit, am_used = q.live_mb("AMResourceLimit"), q.live_mb("usedAMResource")
         pending = (q.live or {}).get("numPendingApplications") or 0
-        what = ("Only part of a queue may hold ApplicationMasters: %s of queue %s "
-                "(maximum-am-resource-percent). Each Spark app has one AM of %s (%s)."
-                % (pct(q.am_pct), q.path, mb(am.size), who))
+        what = (
+            "Only part of a queue may hold ApplicationMasters: %s of queue %s "
+            "(maximum-am-resource-percent). Each Spark app has one AM of %s (%s)."
+            % (pct(q.am_pct), q.path, mb(am.size), who)
+        )
         if am_limit:
             fits = int(am_limit // am.size)
             if fits == 0:
-                add("PROBLEM", "A Spark ApplicationMaster does not fit in queue %s's AM pool" % q.path,
+                add(
+                    "PROBLEM",
+                    "A Spark ApplicationMaster does not fit in queue %s's AM pool" % q.path,
                     what + " The pool is only %s, so apps stay in ACCEPTED." % mb(am_limit),
-                    "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent." % q.path)
+                    "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent." % q.path,
+                )
             elif pending and am_used is not None and am_used + am.size > am_limit:
-                add("PROBLEM", "Apps wait in queue %s because its AM pool is full" % q.path,
-                    what + " The pool is %s and %s is in use, so %d app%s wait%s in ACCEPTED."
-                    % (mb(am_limit), mb(am_used), pending, "" if pending == 1 else "s",
-                       "s" if pending == 1 else ""),
+                add(
+                    "PROBLEM",
+                    "Apps wait in queue %s because its AM pool is full" % q.path,
+                    what
+                    + " The pool is %s and %s is in use, so %d app%s wait%s in ACCEPTED."
+                    % (mb(am_limit), mb(am_used), pending, "" if pending == 1 else "s", "s" if pending == 1 else ""),
                     "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent, or run fewer apps "
-                    "at the same time." % q.path)
+                    "at the same time." % q.path,
+                )
             else:
-                add("OK" if fits >= 3 else "WARNING",
-                    "Queue %s can run about %d Spark app%s at the same time" % (q.path, fits,
-                                                                              "" if fits == 1 else "s"),
-                    what + " The pool is %s now, so about %d apps fit; more wait in ACCEPTED."
-                    % (mb(am_limit), fits),
-                    None if fits >= 3 else
-                    "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent." % q.path)
-        elif q.am_pct is not None and q.abs_cap is not None:
-            add("NOTE", "The AM pool of queue %s is %s to %s of the cluster" % (
-                q.path, pct(q.abs_cap * q.am_pct), pct(q.abs_max * q.am_pct)),
+                add(
+                    "OK" if fits >= 3 else "WARNING",
+                    "Queue %s can run about %d Spark app%s at the same time" % (q.path, fits, "" if fits == 1 else "s"),
+                    what + " The pool is %s now, so about %d apps fit; more wait in ACCEPTED." % (mb(am_limit), fits),
+                    None if fits >= 3 else "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent." % q.path,
+                )
+        elif q.am_pct is not None and q.abs_cap is not None and q.abs_max is not None:
+            add(
+                "NOTE",
+                "The AM pool of queue %s is %s to %s of the cluster"
+                % (q.path, pct(q.abs_cap * q.am_pct), pct(q.abs_max * q.am_pct)),
                 what + " The pool grows from the queue's guaranteed share towards its maximum when "
-                "other queues leave room. Run with --live to see it in MB and how many apps fit.")
+                "other queues leave room. Run with --live to see it in MB and how many apps fit.",
+            )
 
     # ---- Oozie launchers in the same queue as the Spark AMs
     if oozie.props is not None and q is not None:
@@ -826,38 +1010,54 @@ def find_problems(files, queues, live, executor, am, deploy):
         if lq is q:
             am_limit = q.live_mb("AMResourceLimit")
             per_wf = launcher_mb + am.size
-            text = ("If you run Spark from Oozie workflows: each Oozie Spark action keeps a launcher of %s running in YARN until its Spark job "
-                    "ends, and the Spark job adds its own AM of %s. Both count against queue %s's AM pool."
-                    % (mb(launcher_mb), mb(am.size), q.path))
+            text = (
+                "If you run Spark from Oozie workflows: each Oozie Spark action keeps a launcher of %s running "
+                "in YARN until its Spark job ends, and the Spark job adds its own AM of %s. Both count against "
+                "queue %s's AM pool." % (mb(launcher_mb), mb(am.size), q.path)
+            )
             if am_limit:
                 n = int(am_limit // per_wf)
-                text += (" The pool (%s) holds about %d such workflows at once. If more start together, "
-                         "launchers can fill the pool, so their Spark jobs never start (a deadlock)."
-                         % (mb(am_limit), n))
+                text += (
+                    " The pool (%s) holds about %d such workflows at once. If more start together, "
+                    "launchers can fill the pool, so their Spark jobs never start (a deadlock)." % (mb(am_limit), n)
+                )
                 level = "WARNING" if n <= 4 else "NOTE"
             else:
-                text += " If many workflows start together, launchers can fill the pool, so their Spark " \
-                        "jobs never start (a deadlock)."
+                text += (
+                    " If many workflows start together, launchers can fill the pool, so their Spark "
+                    "jobs never start (a deadlock)."
+                )
                 level = "NOTE"
             user_am = ((q.live or {}).get("userAMResourceLimit") or {}).get("memory")
             if user_am and per_wf > user_am:
-                add("PROBLEM", "A Spark action from Oozie can never start in queue %s" % q.path,
+                add(
+                    "PROBLEM",
+                    "A Spark action from Oozie can never start in queue %s" % q.path,
                     "When the launcher and the Spark job run as the same user (the usual case), the "
                     "launcher (%s) and the Spark AM (%s) both count against that user's AM limit in queue %s: "
                     "%s together, but the limit is %s. The launcher starts, and the Spark AM then waits in "
-                    "ACCEPTED for good. See \"Can a new Spark app start here now?\" under Queue room in numbers."
+                    'ACCEPTED for good. See "Can a new Spark app start here now?" under Queue room in numbers.'
                     % (mb(launcher_mb), mb(am.size), q.path, mb(per_wf), mb(user_am)),
                     "Send the launchers to another queue (oozie.launcher.default.queue), or raise "
                     "yarn.scheduler.capacity.%s.maximum-am-resource-percent (or its user-limit-factor, which "
-                    "also raises the user AM limit)." % q.path)
-            add(level, "Oozie launchers and Spark apps share queue %s" % q.path, text,
+                    "also raises the user AM limit)." % q.path,
+                )
+            add(
+                level,
+                "Oozie launchers and Spark apps share queue %s" % q.path,
+                text,
                 "Send the launchers to another queue: oozie.launcher.default.queue in oozie-site.xml, or "
-                "<launcher><queue> in the workflow action." if len(queues) > 1 else
-                "Create a small queue for the launchers and set oozie.launcher.default.queue to it.")
+                "<launcher><queue> in the workflow action."
+                if len(queues) > 1
+                else "Create a small queue for the launchers and set oozie.launcher.default.queue to it.",
+            )
         elif lq is not None:
-            add("OK", "Oozie launchers use their own queue",
+            add(
+                "OK",
+                "Oozie launchers use their own queue",
                 "Launchers run in %s and Spark apps in %s, so launchers cannot block the Spark "
-                "ApplicationMasters." % (lq.path, q.path))
+                "ApplicationMasters." % (lq.path, q.path),
+            )
 
     # ---- the user limit of each queue
     for path in sorted(queues):
@@ -866,27 +1066,37 @@ def find_problems(files, queues, live, executor, am, deploy):
         if one is None or qq.abs_max is None or one >= qq.abs_max - 1e-9:
             continue
         need = qq.abs_max / qq.abs_cap if qq.abs_cap else None
-        add("WARNING" if qq is q else "NOTE",
+        add(
+            "WARNING" if qq is q else "NOTE",
             "In queue %s one user can use only %s of the cluster" % (path, pct(one)),
             "The queue can grow to %s of the cluster when other queues are idle, but user-limit-factor "
             "%.3g stops one user at %.3g x the queue's guaranteed %s. YARN checks the limit before it "
             "starts each container, so a user can go over it by up to one container. If one user runs "
             "the apps, they wait while part of the cluster stays idle."
             % (pct(qq.abs_max), qq.ulf, qq.ulf, pct(qq.abs_cap)),
-            "Set yarn.scheduler.capacity.%s.user-limit-factor to %.2f or more." % (path, need) if need else None)
+            "Set yarn.scheduler.capacity.%s.user-limit-factor to %.2f or more." % (path, need) if need else None,
+        )
         if qq.min_user_pct < 100:
-            add("NOTE", "In queue %s each waiting user gets at least %.0f%% of the queue" % (path, qq.min_user_pct),
-                "With several active users, YARN shares the queue between them (minimum-user-limit-percent).")
+            add(
+                "NOTE",
+                "In queue %s each waiting user gets at least %.0f%% of the queue" % (path, qq.min_user_pct),
+                "With several active users, YARN shares the queue between them (minimum-user-limit-percent).",
+            )
 
     # ---- what Spark itself limits
     if spark.get("spark.dynamicAllocation.enabled", "false").lower() == "true":
         if spark.get("spark.dynamicAllocation.maxExecutors"):
-            add("NOTE", "Spark asks for at most %s executors" % spark.get("spark.dynamicAllocation.maxExecutors"),
-                "spark.dynamicAllocation.maxExecutors caps each app. Few executors can be this limit, "
-                "not YARN.")
+            add(
+                "NOTE",
+                "Spark asks for at most %s executors" % spark.get("spark.dynamicAllocation.maxExecutors"),
+                "spark.dynamicAllocation.maxExecutors caps each app. Few executors can be this limit, not YARN.",
+            )
     elif spark.get("spark.executor.instances"):
-        add("NOTE", "Spark asks for exactly %s executors" % spark.get("spark.executor.instances"),
-            "Dynamic allocation is off, so each app gets spark.executor.instances executors at most.")
+        add(
+            "NOTE",
+            "Spark asks for exactly %s executors" % spark.get("spark.executor.instances"),
+            "Dynamic allocation is off, so each app gets spark.executor.instances executors at most.",
+        )
 
     # ---- apps waiting anywhere (live)
     for path, qq in sorted(queues.items()):
@@ -896,75 +1106,113 @@ def find_problems(files, queues, live, executor, am, deploy):
         am_limit, am_used = qq.live_mb("AMResourceLimit"), qq.live_mb("usedAMResource")
         title = "%d app%s waiting in queue %s" % (pending, " is" if pending == 1 else "s are", path)
         if am_limit and am_used is not None and am_used + am.size > am_limit:
-            add("PROBLEM", title + " because its AM pool is full",
+            add(
+                "PROBLEM",
+                title + " because its AM pool is full",
                 "The queue's AM pool is %s and %s of it is in use, so a new ApplicationMaster (%s for a "
                 "Spark app) does not fit. The apps stay in ACCEPTED until a running app ends."
                 % (mb(am_limit), mb(am_used), mb(am.size)),
                 "Raise yarn.scheduler.capacity.%s.maximum-am-resource-percent, or run fewer apps at the "
-                "same time in this queue." % path)
+                "same time in this queue." % path,
+            )
         else:
-            add("WARNING", title,
+            add(
+                "WARNING",
+                title,
                 "The apps stay in ACCEPTED. Their AM pool has room, so the queue is probably at its "
-                "limit (see \"One user max\" and \"Max\" in the queue table) or no node has room.")
+                'limit (see "One user max" and "Max" in the queue table) or no node has room.',
+            )
     # ---- running apps that do not get what they ask for (live)
-    starved = [a for a in (live or {}).get("apps") or []
-               if a.get("state") == "RUNNING" and why_no_resources(a, live, queues)]
+    starved = (
+        [a for a in live.get("apps") or [] if a.get("state") == "RUNNING" and why_no_resources(a, live, queues)]
+        if live
+        else []
+    )
     if starved:
-        add("WARNING", "%d running app%s do%s not get all the resources %s ask%s for" % (
-            len(starved), "" if len(starved) == 1 else "s", "es" if len(starved) == 1 else "",
-            "it" if len(starved) == 1 else "they", "s" if len(starved) == 1 else ""),
-            "%s. The Apps section below says why for each app, under \"Why running apps do not get more "
-            "resources\"." % ", ".join("%s (%s)" % (a.get("id"), a.get("name")) for a in starved[:5]),
-            None)
+        add(
+            "WARNING",
+            "%d running app%s do%s not get all the resources %s ask%s for"
+            % (
+                len(starved),
+                "" if len(starved) == 1 else "s",
+                "es" if len(starved) == 1 else "",
+                "it" if len(starved) == 1 else "they",
+                "s" if len(starved) == 1 else "",
+            ),
+            '%s. The Apps section below says why for each app, under "Why running apps do not get more '
+            'resources".' % ", ".join("%s (%s)" % (a.get("id"), a.get("name")) for a in starved[:5]),
+            None,
+        )
 
     # ---- apps that wait because one user's AM limit is full (live)
-    blocked = {}
+    blocked: Dict[Tuple[str, str], List[Json]] = {}
     for a in (live or {}).get("apps") or []:
         if a.get("state") == "ACCEPTED" and "user's am resource limit exceeded" in (a.get("diagnostics") or "").lower():
             blocked.setdefault((str(a.get("user", "?")), str(a.get("queue", "?"))), []).append(a)
     for (user, qname), group in sorted(blocked.items()):
-        add("PROBLEM", "%d app%s of user %s wait%s: the user's AM limit is full" % (
-            len(group), "" if len(group) == 1 else "s", user, "s" if len(group) == 1 else ""),
+        add(
+            "PROBLEM",
+            "%d app%s of user %s wait%s: the user's AM limit is full"
+            % (len(group), "" if len(group) == 1 else "s", user, "s" if len(group) == 1 else ""),
             "YARN gives each user only part of a queue's AM pool, and all apps of one user share it. "
             "The running apps of %s in queue %s hold all of it, so its new apps stay in ACCEPTED, even "
-            "if the queue has room. A service account that submits many apps meets this limit first."
-            % (user, qname),
+            "if the queue has room. A service account that submits many apps meets this limit first." % (user, qname),
             "Raise yarn.scheduler.capacity.<queue>.user-limit-factor for this queue (the user AM limit grows "
-            "with it), submit as several users (--proxy-user), or run fewer apps at the same time.")
+            "with it), submit as several users (--proxy-user), or run fewer apps at the same time.",
+        )
     return sorted(out, key=lambda f: Finding.ORDER[f.level])
 
 
 # ================================================================== the report
 
 TERMS = [
-    ("Container", "A share of one node's memory and vcores that YARN gives to a process. Each Spark "
-                  "executor runs in one container."),
-    ("ApplicationMaster (AM)", "The first container of each YARN app; it asks YARN for the other "
-                               "containers. In Spark cluster mode the driver runs in it."),
-    ("AM pool", "The part of a queue that ApplicationMasters may use (maximum-am-resource-percent). "
-                "When it is full, new apps wait in ACCEPTED even if the cluster has free memory."),
+    (
+        "Container",
+        "A share of one node's memory and vcores that YARN gives to a process. Each Spark "
+        "executor runs in one container.",
+    ),
+    (
+        "ApplicationMaster (AM)",
+        "The first container of each YARN app; it asks YARN for the other "
+        "containers. In Spark cluster mode the driver runs in it.",
+    ),
+    (
+        "AM pool",
+        "The part of a queue that ApplicationMasters may use (maximum-am-resource-percent). "
+        "When it is full, new apps wait in ACCEPTED even if the cluster has free memory.",
+    ),
     ("Overhead", "Memory that Spark adds to the heap for the JVM itself, threads and buffers."),
-    ("Guaranteed / Max", "A queue always gets its guaranteed share; it can borrow up to its "
-                                 "maximum when other queues are idle."),
-    ("One user", "The most of the cluster that one user's apps can use in the queue "
-                     "(user-limit-factor x guaranteed share)."),
-    ("Oozie launcher", "A small YARN app that Oozie starts for each action; it stays until the action "
-                       "(for example the Spark job) ends."),
+    (
+        "Guaranteed / Max",
+        "A queue always gets its guaranteed share; it can borrow up to its maximum when other queues are idle.",
+    ),
+    (
+        "One user",
+        "The most of the cluster that one user's apps can use in the queue (user-limit-factor x guaranteed share).",
+    ),
+    (
+        "Oozie launcher",
+        "A small YARN app that Oozie starts for each action; it stays until the action "
+        "(for example the Spark job) ends.",
+    ),
 ]
 
 
-def print_findings(findings):
-    counts = {}
+def print_findings(findings: List[Finding]) -> None:
+    counts: Dict[str, int] = {}
     for f in findings:
         counts[f.level] = counts.get(f.level, 0) + 1
-    parts = ["%d %s%s" % (counts[l], "OK" if l == "OK" else l.lower(), "" if counts[l] == 1 or l == "OK" else "s")
-             for l in ("PROBLEM", "WARNING", "NOTE", "OK") if counts.get(l)]
+    parts = [
+        "%d %s%s" % (counts[lv], "OK" if lv == "OK" else lv.lower(), "" if counts[lv] == 1 or lv == "OK" else "s")
+        for lv in ("PROBLEM", "WARNING", "NOTE", "OK")
+        if counts.get(lv)
+    ]
     if not findings:
         section("Findings", "No findings: the files that the checks need could not be read (see above).")
         return
     section("Findings")
-    levels = [l for l in ("PROBLEM", "WARNING", "NOTE", "OK") if counts.get(l)]
-    print("Summary: " + ", ".join(paint(p, l) for p, l in zip(parts, levels)) + ".")
+    levels = [lv for lv in ("PROBLEM", "WARNING", "NOTE", "OK") if counts.get(lv)]
+    print("Summary: " + ", ".join(paint(p, lv) for p, lv in zip(parts, levels)) + ".")
     print()
     for f in findings:
         tag = "[%s]" % f.level
@@ -980,95 +1228,145 @@ def print_findings(findings):
         print()
 
 
-def print_containers(executor, am, deploy, spark):
-    section("What one Spark app asks YARN for",
-            "From spark-defaults.conf (deploy mode: %s). Options given to spark-submit (--conf, "
-            "--executor-memory, ...) change these for one app." % deploy)
+def print_containers(executor: Container, am: Container, deploy: str, spark: ConfigFile) -> None:
+    section(
+        "What one Spark app asks YARN for",
+        "From spark-defaults.conf (deploy mode: %s). Options given to spark-submit (--conf, "
+        "--executor-memory, ...) change these for one app." % deploy,
+    )
     rows = []
     for c in (executor, am):
-        rows.append([c.name, mb(c.heap), mb(c.overhead), mb(c.other) if c.other else "-",
-                     mb(c.size), str(c.vcores)])
-    table(["Container", "Heap", "Overhead", "Other", "Size in YARN", "vcores"], rows,
-          roles=["label", None, None, None, "value", None])
+        rows.append([c.name, mb(c.heap), mb(c.overhead), mb(c.other) if c.other else "-", mb(c.size), str(c.vcores)])
+    table(
+        ["Container", "Heap", "Overhead", "Other", "Size in YARN", "vcores"],
+        rows,
+        roles=["label", None, None, None, "value", None],
+    )
     print()
-    print(highlight(wrap("Heap of the executor: %s. Overhead: %s.%s Size in YARN is the total rounded up to a "
-               "multiple of yarn.scheduler.minimum-allocation-mb."
-               % (executor.heap_note, executor.overhead_note,
-                  " Other: %s." % executor.other_note if executor.other_note else ""), "  ")))
+    print(
+        highlight(
+            wrap(
+                "Heap of the executor: %s. Overhead: %s.%s Size in YARN is the total rounded up to a "
+                "multiple of yarn.scheduler.minimum-allocation-mb."
+                % (
+                    executor.heap_note,
+                    executor.overhead_note,
+                    " Other: %s." % executor.other_note if executor.other_note else "",
+                ),
+                "  ",
+            )
+        )
+    )
     if spark.get("spark.dynamicAllocation.enabled", "false").lower() == "true":
         count = "between %s and %s (dynamic allocation)" % (
             spark.get("spark.dynamicAllocation.minExecutors", "0"),
-            spark.get("spark.dynamicAllocation.maxExecutors", "no limit"))
+            spark.get("spark.dynamicAllocation.maxExecutors", "no limit"),
+        )
     else:
         count = "%s (spark.executor.instances)" % spark.get("spark.executor.instances", "2")
     print(highlight(wrap("Number of executors per app: %s." % count, "  ")))
 
 
 QUEUE_COLUMNS = [
-    ("Queue", "The queue name. (Spark) marks the queue in spark.yarn.queue, where your Spark apps run. "
-              "(Oozie) marks the queue of the Oozie launchers."),
-    ("Of parent", "The capacity of the queue as written in capacity-scheduler.xml: its share of the parent "
-                  "queue (the frame title names the parent). The children of one parent must add up to 100%; "
-                  "the line under each frame shows the sum. A weight such as 2w gets weight / sum of weights."),
-    ("Guaranteed", "The share of the whole cluster that the queue always gets when it has work "
-                   "(its capacity, times the capacity of each parent queue). If other queues borrowed it, "
-                   "YARN gives it back as their containers end."),
-    ("Max", "The most of the cluster that the queue can use (maximum-capacity). Above Guaranteed, it can "
-            "only borrow what other queues leave idle, and it gives it back when they need it."),
-    ("One user", "The most of the cluster that the apps of one user can use together in this queue: "
-                 "user-limit-factor x Guaranteed, never more than Max. With a factor of 1, one user cannot "
-                 "borrow above the guaranteed share, even when the cluster is idle."),
-    ("Smallest share per user", "Not a column: minimum-user-limit-percent in the Settings. When several "
-                                "users have apps in the queue at the same time, each one gets at least this "
-                                "part of the queue. 100% (the default) means no sharing rule."),
-    ("AM pool used", "Each YARN app has one ApplicationMaster (AM): for Spark in cluster mode it holds the "
-                     "driver, and each Oozie launcher is one too. All AMs of a queue together may use only "
-                     "part of it (maximum-am-resource-percent). The column shows the AM memory in use, of the "
-                     "most allowed. When the pool is full, new apps wait in ACCEPTED even if memory is free. "
-                     "Without live data it shows the range as a share of the cluster."),
+    (
+        "Queue",
+        "The queue name. (Spark) marks the queue in spark.yarn.queue, where your Spark apps run. "
+        "(Oozie) marks the queue of the Oozie launchers.",
+    ),
+    (
+        "Of parent",
+        "The capacity of the queue as written in capacity-scheduler.xml: its share of the parent "
+        "queue (the frame title names the parent). The children of one parent must add up to 100%; "
+        "the line under each frame shows the sum. A weight such as 2w gets weight / sum of weights.",
+    ),
+    (
+        "Guaranteed",
+        "The share of the whole cluster that the queue always gets when it has work "
+        "(its capacity, times the capacity of each parent queue). If other queues borrowed it, "
+        "YARN gives it back as their containers end.",
+    ),
+    (
+        "Max",
+        "The most of the cluster that the queue can use (maximum-capacity). Above Guaranteed, it can "
+        "only borrow what other queues leave idle, and it gives it back when they need it.",
+    ),
+    (
+        "One user",
+        "The most of the cluster that the apps of one user can use together in this queue: "
+        "user-limit-factor x Guaranteed, never more than Max. With a factor of 1, one user cannot "
+        "borrow above the guaranteed share, even when the cluster is idle.",
+    ),
+    (
+        "Smallest share per user",
+        "Not a column: minimum-user-limit-percent in the Settings. When several "
+        "users have apps in the queue at the same time, each one gets at least this "
+        "part of the queue. 100% (the default) means no sharing rule.",
+    ),
+    (
+        "AM pool used",
+        "Each YARN app has one ApplicationMaster (AM): for Spark in cluster mode it holds the "
+        "driver, and each Oozie launcher is one too. All AMs of a queue together may use only "
+        "part of it (maximum-am-resource-percent). The column shows the AM memory in use, of the "
+        "most allowed. When the pool is full, new apps wait in ACCEPTED even if memory is free. "
+        "Without live data it shows the range as a share of the cluster.",
+    ),
     ("Used", "Memory that the queue's containers use now (live data)."),
     ("Run / Wait", "Apps that run now / apps that wait in ACCEPTED to start (live data)."),
 ]
 
 
-def queue_example(q, am):
+def queue_example(q: Queue, am: Container) -> str:
     """A worked example with the numbers of one queue, so the columns are easy to read."""
     if q.abs_cap is not None and q.abs_max is not None and q.abs_max > q.abs_cap + 1e-9:
-        text = ("Example, queue %s: it always gets %s of the cluster, and can grow to %s when other "
-                "queues are idle." % (q.path, pct(q.abs_cap), pct(q.abs_max)))
+        text = "Example, queue %s: it always gets %s of the cluster, and can grow to %s when other queues are idle." % (
+            q.path,
+            pct(q.abs_cap),
+            pct(q.abs_max),
+        )
     else:
-        text = ("Example, queue %s: it always gets %s of the cluster and cannot grow above it."
-                % (q.path, pct(q.abs_cap)))
+        text = "Example, queue %s: it always gets %s of the cluster and cannot grow above it." % (
+            q.path,
+            pct(q.abs_cap),
+        )
     if q.one_user_max is not None:
         if q.ulf <= 0:
             text += " One user has no limit inside it (user-limit-factor %g)." % q.ulf
         else:
-            text += (" One user's apps together can use up to %s (user-limit-factor %g x %s)."
-                     % (pct(q.one_user_max), q.ulf, pct(q.abs_cap)))
+            text += " One user's apps together can use up to %s (user-limit-factor %g x %s)." % (
+                pct(q.one_user_max),
+                q.ulf,
+                pct(q.abs_cap),
+            )
             if q.abs_max is not None and q.one_user_max < q.abs_max - 1e-9:
-                text += (" So one user alone cannot use the part between %s and %s; that needs a second "
-                         "user, or a higher user-limit-factor." % (pct(q.one_user_max), pct(q.abs_max)))
+                text += (
+                    " So one user alone cannot use the part between %s and %s; that needs a second "
+                    "user, or a higher user-limit-factor." % (pct(q.one_user_max), pct(q.abs_max))
+                )
     am_limit = q.live_mb("AMResourceLimit")
     if am_limit:
         used = q.live_mb("usedAMResource") or 0
-        text += (" Its AM pool is %s, with %s in use; one Spark app needs an AM of %s, so about %d apps "
-                 "fit in all, and %d more can start now." % (mb(am_limit), mb(used), mb(am.size),
-                                                             int(am_limit // am.size),
-                                                             max(0, int((am_limit - used) // am.size))))
-    elif q.am_pct is not None and q.abs_cap is not None:
-        text += (" Its AM pool is %s of the queue, so %s to %s of the cluster; run with --live to see "
-                 "it in MB." % (pct(q.am_pct), pct(q.abs_cap * q.am_pct), pct(q.abs_max * q.am_pct)))
+        text += (
+            " Its AM pool is %s, with %s in use; one Spark app needs an AM of %s, so about %d apps "
+            "fit in all, and %d more can start now."
+            % (mb(am_limit), mb(used), mb(am.size), int(am_limit // am.size), max(0, int((am_limit - used) // am.size)))
+        )
+    elif q.am_pct is not None and q.abs_cap is not None and q.abs_max is not None:
+        text += " Its AM pool is %s of the queue, so %s to %s of the cluster; run with --live to see it in MB." % (
+            pct(q.am_pct),
+            pct(q.abs_cap * q.am_pct),
+            pct(q.abs_max * q.am_pct),
+        )
     return text
 
 
-def queue_groups(cs, live):
+def queue_groups(cs: ConfigFile, live: Optional[Live]) -> List[Tuple[str, str, List[Json]]]:
     """Each parent queue with its children, in tree order: [(parent path, kind, [child, ...])].
     kind is "percent", "weight" or "other" (absolute resources). A child is a dict with path, raw (the
     capacity as written), share (of the parent, 0..1, or None), abs_cap, abs_max, has_children and live."""
     tree = (live or {}).get("tree") or {}
-    groups = []
+    groups: List[Tuple[str, str, List[Json]]] = []
 
-    def kids(path):
+    def kids(path: str) -> List[str]:
         if cs.props:
             names = cs.get("yarn.scheduler.capacity.%s.queues" % path) or ""
             return ["%s.%s" % (path, n.strip()) for n in names.split(",") if n.strip()]
@@ -1077,11 +1375,11 @@ def queue_groups(cs, live):
             children = [children]
         return [c.get("queuePath") or "%s.%s" % (path, c.get("queueName", "?")) for c in children]
 
-    def walk(path, abs_cap, abs_max):
+    def walk(path: str, abs_cap: Optional[float], abs_max: Optional[float]) -> None:
         paths = kids(path)
         if not paths:
             return
-        children = []
+        children: List[Json] = []
         for p in paths:
             lq = tree.get(p)
             if cs.props:
@@ -1095,13 +1393,14 @@ def queue_groups(cs, live):
             children.append({"path": p, "raw": raw, "maxcap": maxcap, "live": lq})
         if all(c["raw"].lower().endswith("w") and to_float(c["raw"][:-1]) is not None for c in children):
             kind = "weight"
-            total = sum(to_float(c["raw"][:-1]) for c in children) or 1.0
+            total = sum(to_float(c["raw"][:-1]) or 0.0 for c in children) or 1.0  # all are numbers: checked above
             for c in children:
-                c["share"] = to_float(c["raw"][:-1]) / total
+                c["share"] = (to_float(c["raw"][:-1]) or 0.0) / total
         else:
             kind = "percent" if all(to_float(c["raw"]) is not None for c in children) else "other"
             for c in children:
-                c["share"] = to_float(c["raw"]) / 100.0 if to_float(c["raw"]) is not None else None
+                share = to_float(c["raw"])
+                c["share"] = share / 100.0 if share is not None else None
         for c in children:
             lq = c["live"] or {}
             if not cs.props and lq:
@@ -1120,38 +1419,57 @@ def queue_groups(cs, live):
     return groups
 
 
-def group_sum(kind, children, parent):
+def group_sum(kind: str, children: List[Json], parent: str) -> Tuple[str, Optional[str]]:
     """The line under a group of sibling queues: how their shares add up. Returns (text, role)."""
     if kind == "weight":
-        return ("weights %s: each queue gets its weight / %s of %s"
-                % (" + ".join(c["raw"] for c in children),
-                   "%g" % sum(to_float(c["raw"][:-1]) for c in children), parent), "good")
+        return (
+            "weights %s: each queue gets its weight / %s of %s"
+            % (
+                " + ".join(c["raw"] for c in children),
+                "%g" % sum(to_float(c["raw"][:-1]) or 0.0 for c in children),
+                parent,
+            ),
+            "good",
+        )
     if kind == "other":
         return "capacities in absolute resources: the sum is not checked here", None
     total = sum(c["share"] for c in children) * 100
-    text = "%s = %s of %s" % (" + ".join("%g%%" % (c["share"] * 100) for c in children), "%g%%" % round(total, 2),
-                              parent)
+    text = "%s = %s of %s" % (
+        " + ".join("%g%%" % (c["share"] * 100) for c in children),
+        "%g%%" % round(total, 2),
+        parent,
+    )
     if abs(total - 100) < 0.01:
         return text + " " + MARK_OK, "good"
     return text + ", not 100%: check the capacities of these queues", "bad"
 
 
-def print_terms(pairs):
+def print_terms(pairs: Sequence[Tuple[str, str]]) -> None:
     """Print term / meaning pairs: the meaning in a column next to the term, a blank line after each."""
     width = max(len(term) for term, _ in pairs) + 2
     for term, meaning in pairs:
         # wrap and cut the indent first, colour last: colour codes would shift the cut
-        text = wrap(meaning, " " * (width + 2), " " * (width + 2))[width + 2:]
+        text = wrap(meaning, " " * (width + 2), " " * (width + 2))[width + 2 :]
         print("  " + paint(term.ljust(width), "label") + highlight(text))
         print()
 
 
-def print_queues(queues, groups, spark_queue, launcher_queue, am_container, explain=True):
-    section("Queues", "How YARN shares the cluster between the queues. Each frame holds the children of one "
-                      "parent queue; their shares of the parent must add up to 100%." +
-            (" The columns are explained below the table." if explain else ""))
+def print_queues(
+    queues: Dict[str, Queue],
+    groups: List[Tuple[str, str, List[Json]]],
+    spark_queue: Optional[Queue],
+    launcher_queue: Optional[Queue],
+    am_container: Container,
+    explain: bool = True,
+) -> None:
+    section(
+        "Queues",
+        "How YARN shares the cluster between the queues. Each frame holds the children of one "
+        "parent queue; their shares of the parent must add up to 100%."
+        + (" The columns are explained below the table." if explain else ""),
+    )
 
-    def leaf_row(q, of_parent):
+    def leaf_row(q: Queue, of_parent: str) -> List[str]:
         roles = []
         if q is spark_queue:
             roles.append("Spark")
@@ -1160,7 +1478,7 @@ def print_queues(queues, groups, spark_queue, launcher_queue, am_container, expl
         am_limit = q.live_mb("AMResourceLimit")
         if am_limit is not None:
             am = "{:,} of {:,} MB".format(int(q.live_mb("usedAMResource") or 0), int(am_limit))
-        elif q.am_pct is not None and q.abs_cap is not None:
+        elif q.am_pct is not None and q.abs_cap is not None and q.abs_max is not None:
             am = "%s-%s" % (pct(q.abs_cap * q.am_pct), pct(q.abs_max * q.am_pct))
         else:
             am = "-"
@@ -1168,11 +1486,19 @@ def print_queues(queues, groups, spark_queue, launcher_queue, am_container, expl
         name = q.path + (" (%s)" % ", ".join(roles) if roles else "")
         if q.state != "RUNNING":
             name += " " + q.state
-        return [name, of_parent, pct(q.abs_cap), pct(q.abs_max), pct(q.one_user_max), am,
-                mb(q.live_mb("resourcesUsed")) if q.live else "-",
-                str(lv.get("numActiveApplications", "-")), str(lv.get("numPendingApplications", "-"))]
+        return [
+            name,
+            of_parent,
+            pct(q.abs_cap),
+            pct(q.abs_max),
+            pct(q.one_user_max),
+            am,
+            mb(q.live_mb("resourcesUsed")) if q.live else "-",
+            str(lv.get("numActiveApplications", "-")),
+            str(lv.get("numPendingApplications", "-")),
+        ]
 
-    def of_parent(c):
+    def of_parent(c: Json) -> str:
         if c["share"] is None:
             return c["raw"]
         if c["raw"].lower().endswith("w"):
@@ -1181,9 +1507,10 @@ def print_queues(queues, groups, spark_queue, launcher_queue, am_container, expl
 
     headers = ["Queue", "Of parent", "Guaranteed", "Max", "One user", "AM pool used", "Used", "Run", "Wait"]
     roles = ["queue", None, None, None, None, None, None, None, lambda c: "bad" if c not in ("0", "-") else None]
-    blocks, shown = [], set()
+    blocks: List[Tuple[str, Tuple[str, Optional[str]], List[List[str]]]] = []
+    shown: Set[str] = set()
     for parent, kind, children in groups:
-        rows = []
+        rows: List[List[str]] = []
         for c in children:
             q = queues.get(c["path"])
             if q is not None and not c["has_children"]:
@@ -1192,8 +1519,19 @@ def print_queues(queues, groups, spark_queue, launcher_queue, am_container, expl
             else:
                 lq = c["live"] or {}
                 used = (lq.get("resourcesUsed") or {}).get("memory")
-                rows.append([c["path"] + " (parent)", of_parent(c), pct(c["abs_cap"]), pct(c["abs_max"]),
-                             "-", "-", mb(used) if c["live"] else "-", "-", "-"])
+                rows.append(
+                    [
+                        c["path"] + " (parent)",
+                        of_parent(c),
+                        pct(c["abs_cap"]),
+                        pct(c["abs_max"]),
+                        "-",
+                        "-",
+                        mb(used) if c["live"] else "-",
+                        "-",
+                        "-",
+                    ]
+                )
         blocks.append((parent, group_sum(kind, children, parent), rows))
     rest = [leaf_row(queues[p], "-") for p in sorted(queues) if p not in shown]
 
@@ -1226,16 +1564,17 @@ def print_queues(queues, groups, spark_queue, launcher_queue, am_container, expl
 
 # ================================================================== queue balance sheets
 
-def gb(n):
+
+def gb(n: Optional[float]) -> str:
     return "-" if n is None else "%.2f GB" % (n / 1024.0)
 
 
-def res(d, key="memory"):
+def res(d: Any, key: str = "memory") -> Optional[float]:
     """A number from a resource object of the REST API ({"memory": .., "vCores": ..}), or None."""
     return to_float((d or {}).get(key)) if isinstance(d, dict) else None
 
 
-def effective(lq, which):
+def effective(lq: Optional[Json], which: str) -> Optional[Json]:
     """effectiveMinResource / effectiveMaxResource of the default partition (Hadoop 3.1+), or None."""
     parts = ((lq or {}).get("capacities") or {}).get("queueCapacitiesByPartition") or []
     if isinstance(parts, dict):
@@ -1248,12 +1587,12 @@ def effective(lq, which):
     return None
 
 
-def queue_users(lq):
+def queue_users(lq: Optional[Json]) -> List[Json]:
     users = ((lq or {}).get("users") or {}).get("user") or []
     return [users] if isinstance(users, dict) else users
 
 
-def queue_balance(q, live, am_size, executor_size):
+def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Optional[Balance]:
     """All the numbers of one queue's balance sheet, from the live data. None without live data."""
     lq = q.live
     if not lq:
@@ -1261,7 +1600,7 @@ def queue_balance(q, live, am_size, executor_size):
     m, tree = live["metrics"], live.get("tree") or {}
     total = to_float(m.get("totalMB")) or 0
     total_vc = to_float(m.get("totalVirtualCores")) or 0
-    b = {"q": q, "total": total, "total_vc": total_vc}
+    b: Balance = {"q": q, "total": total, "total_vc": total_vc}
     abs_cap = (to_float(lq.get("absoluteCapacity")) or 0) / 100.0
     abs_max = (to_float(lq.get("absoluteMaxCapacity")) or 0) / 100.0
     emin, emax = effective(lq, "effectiveMinResource"), effective(lq, "effectiveMaxResource")
@@ -1283,8 +1622,8 @@ def queue_balance(q, live, am_size, executor_size):
             continue
         pmax = (to_float(pq.get("absoluteMaxCapacity")) or 100) / 100.0
         pe = effective(pq, "effectiveMaxResource")
-        pmax_mb = res(pe) if pe else pmax * total
-        pmax_vc = res(pe, "vCores") if pe else pmax * total_vc
+        pmax_mb = (res(pe) if pe else None) or pmax * total
+        pmax_vc = (res(pe, "vCores") if pe else None) or pmax * total_vc
         pused = (res(pq.get("resourcesUsed")) or 0, res(pq.get("resourcesUsed"), "vCores") or 0)
         b["parents"].append((path, pmax, (pmax_mb, pmax_vc), pused, (pmax_mb - pused[0], pmax_vc - pused[1])))
     b["free"] = (to_float(m.get("availableMB")) or 0, to_float(m.get("availableVirtualCores")) or 0)
@@ -1292,11 +1631,15 @@ def queue_balance(q, live, am_size, executor_size):
     b["nodes_free"] = sorted([to_float(n.get("availMemoryMB")) or 0 for n in nodes], reverse=True)
     b["node_free"] = (b["nodes_free"] or [0])[0]
 
-    options = [("the queue maximum", b["left_q"][0])] + \
-              [("the maximum of parent %s" % p[0], p[4][0]) for p in b["parents"]] + \
-              [("the free memory of the cluster", b["free"][0])]
-    b["room_parts"] = [(name, value, scope) for (name, value), scope in
-                       zip(options, [q.path] + [p[0] for p in b["parents"]] + ["cluster"])]
+    options = (
+        [("the queue maximum", b["left_q"][0])]
+        + [("the maximum of parent %s" % p[0], p[4][0]) for p in b["parents"]]
+        + [("the free memory of the cluster", b["free"][0])]
+    )
+    b["room_parts"] = [
+        (name, value, scope)
+        for (name, value), scope in zip(options, [q.path] + [p[0] for p in b["parents"]] + ["cluster"])
+    ]
     room = min(o[1] for o in options)
     b["room_by"] = " and ".join(name for name, value in options if value - room < 1)
     b["room"] = max(0.0, room)
@@ -1314,26 +1657,36 @@ def queue_balance(q, live, am_size, executor_size):
     ulf = to_float(lq.get("userLimitFactor")) or q.ulf  # what the ResourceManager runs with
     b["ulf"] = ulf
     one_user = b["max"][0] if ulf <= 0 else min(ulf * b["guar"][0], b["max"][0])
-    by_app, counts = {}, {}  # from the user's apps in this queue, for Hadoop versions without per-user numbers
+    # from the user's apps in this queue, for Hadoop versions without per-user numbers
+    by_app: Dict[str, float] = {}
+    counts: Dict[str, List[int]] = {}
     for a in live.get("apps") or []:
         if find_queue({q.path: q}, str(a.get("queue", ""))) is q:
-            user = a.get("user")
+            user = str(a.get("user", "?"))
             by_app[user] = by_app.get(user, 0) + max(0, to_float(a.get("allocatedMB")) or 0)
             c = counts.setdefault(user, [0, 0])
             c[0 if a.get("state") == "RUNNING" else 1] += 1
     for u in queue_users(lq):
+        name = str(u.get("username", "?"))
         used = res(u.get("resourcesUsed"))
-        used = by_app.get(u.get("username"), 0) if used is None else used
+        used = by_app.get(name, 0) if used is None else used
         # Not YARN's userResourceLimit: above the queue's guaranteed share YARN recomputes it on every
         # scheduling pass as about "used + one container", so limit - used is always near 0. The ceiling
         # is user-limit-factor x guaranteed, at most the queue maximum.
         limit = one_user
         am_u = res(u.get("AMResourceUsed")) or 0
         am_l = res(u.get("userAMResourceLimit")) or b["user_am_limit"]
-        b["users"].append({"name": u.get("username", "?"), "used": used, "limit": limit, "am_used": am_u,
-                           "am_limit": am_l,
-                           "apps": u.get("numActiveApplications", counts.get(u.get("username"), [0, 0])[0]),
-                           "waiting": u.get("numPendingApplications", counts.get(u.get("username"), [0, 0])[1])})
+        b["users"].append(
+            {
+                "name": name,
+                "used": used,
+                "limit": limit,
+                "am_used": am_u,
+                "am_limit": am_l,
+                "apps": u.get("numActiveApplications", counts.get(name, [0, 0])[0]),
+                "waiting": u.get("numPendingApplications", counts.get(name, [0, 0])[1]),
+            }
+        )
     b["one_user"] = one_user
     return b
 
@@ -1341,212 +1694,348 @@ def queue_balance(q, live, am_size, executor_size):
 NEW_USER = "a new user"
 
 
-def who(user):
+def who(user: User) -> str:
     return user["name"] if user["name"] == NEW_USER else "user " + user["name"]
 
 
-def user_in(b, name):
+def user_in(b: Balance, name: Optional[str]) -> User:
     """The numbers of one user in a queue; a user without apps there starts fresh."""
     for u in b["users"]:
         if u["name"] == name:
             return u
-    return {"name": name or NEW_USER, "used": 0.0, "limit": b["one_user"], "am_used": 0.0, "am_limit": b["user_am_limit"],
-            "apps": 0, "waiting": 0}
+    return {
+        "name": name or NEW_USER,
+        "used": 0.0,
+        "limit": b["one_user"],
+        "am_used": 0.0,
+        "am_limit": b["user_am_limit"],
+        "apps": 0,
+        "waiting": 0,
+    }
 
 
-def room_after(b, taken):
+def room_after(b: Balance, taken: List[Tuple[str, float]]) -> Tuple[float, str]:
     """Room for queue b after earlier steps took memory: taken is [(queue path, MB)]. Memory taken in a queue
     also counts against each of its parents and the cluster. Returns (room, the part that sets it)."""
-    def shared(scope, path):
+
+    def shared(scope: str, path: str) -> bool:
         return scope == "cluster" or path == scope or path.startswith(scope + ".")
-    parts = [(value - sum(m for path, m in taken if shared(scope, path)), name, scope)
-             for name, value, scope in b["room_parts"]]
+
+    parts = [
+        (value - sum(m for path, m in taken if shared(scope, path)), name, scope)
+        for name, value, scope in b["room_parts"]
+    ]
     room, _, scope = min(parts, key=lambda p: p[0])
     return max(0.0, room), scope
 
 
-def qprop(q, name):
+def qprop(q: Queue, name: str) -> str:
     return "yarn.scheduler.capacity.%s.%s" % (q.path, name)
 
 
-def why_room(b, scope, need, what):
+def why_room(b: Balance, scope: str, need: float, what: str) -> Why:
     """Plain explanation when the queue has no room: the queue max, a parent's max or a full cluster.
     An explanation is a dict: title, what (sentences), calc ([(mark, text)], mark "ok", "no" or None),
     props and fix (lists)."""
     q = b["q"]
     if scope == q.path:
-        return {"title": "Queue %s is at its maximum size" % q.path,
-                "what": ["A queue can grow above its guaranteed share, but only up to its maximum "
-                         "(maximum-capacity).",
-                         "Queue %s is at that maximum now." % q.path],
-                "calc": [(None, "Queue max: %s of the cluster = %s" % (pct(b["abs_max"]), gb(b["max"][0]))),
-                         (None, "Used by the apps of the queue: %s" % gb(b["used"][0])),
-                         ("no", "Left: %s, but the %s needs %s" % (gb(max(0, b["left_q"][0])), what, gb(need)))],
-                "props": [qprop(q, "maximum-capacity")],
-                "fix": ["Wait until apps in queue %s end." % q.path,
-                        "Or raise maximum-capacity of queue %s." % q.path]}
+        return {
+            "title": "Queue %s is at its maximum size" % q.path,
+            "what": [
+                "A queue can grow above its guaranteed share, but only up to its maximum (maximum-capacity).",
+                "Queue %s is at that maximum now." % q.path,
+            ],
+            "calc": [
+                (None, "Queue max: %s of the cluster = %s" % (pct(b["abs_max"]), gb(b["max"][0]))),
+                (None, "Used by the apps of the queue: %s" % gb(b["used"][0])),
+                ("no", "Left: %s, but the %s needs %s" % (gb(max(0, b["left_q"][0])), what, gb(need))),
+            ],
+            "props": [qprop(q, "maximum-capacity")],
+            "fix": ["Wait until apps in queue %s end." % q.path, "Or raise maximum-capacity of queue %s." % q.path],
+        }
     for path, pmax, pm, pused, pleft in b["parents"]:
         if path == scope:
-            return {"title": "Parent queue %s is at its maximum size" % path,
-                    "what": ["All queues under %s share its maximum (maximum-capacity)." % path,
-                             "Together they use it up now.",
-                             "So queue %s cannot grow, even if it is below its own maximum." % q.path],
-                    "calc": [(None, "%s max: %s of the cluster = %s" % (path, pct(pmax), gb(pm[0]))),
-                             (None, "Used by all queues under %s: %s" % (path, gb(pused[0]))),
-                             ("no", "Left: %s, but the %s needs %s" % (gb(max(0, pleft[0])), what, gb(need)))],
-                    "props": ["yarn.scheduler.capacity.%s.maximum-capacity" % path],
-                    "fix": ["Wait until apps under %s end." % path,
-                            "Or raise maximum-capacity of queue %s." % path]}
+            return {
+                "title": "Parent queue %s is at its maximum size" % path,
+                "what": [
+                    "All queues under %s share its maximum (maximum-capacity)." % path,
+                    "Together they use it up now.",
+                    "So queue %s cannot grow, even if it is below its own maximum." % q.path,
+                ],
+                "calc": [
+                    (None, "%s max: %s of the cluster = %s" % (path, pct(pmax), gb(pm[0]))),
+                    (None, "Used by all queues under %s: %s" % (path, gb(pused[0]))),
+                    ("no", "Left: %s, but the %s needs %s" % (gb(max(0, pleft[0])), what, gb(need))),
+                ],
+                "props": ["yarn.scheduler.capacity.%s.maximum-capacity" % path],
+                "fix": ["Wait until apps under %s end." % path, "Or raise maximum-capacity of queue %s." % path],
+            }
     below = b["used"][0] < b["guar"][0]
-    return {"title": "The cluster is full",
-            "what": ["Queue %s is allowed more, but the memory is not there." % q.path,
-                     "Other queues use the rest of the cluster now."],
-            "calc": [(None, "Cluster for YARN: %s" % gb(b["total"])),
-                     ("no", "Free now: %s, but the %s needs %s" % (gb(b["free"][0]), what, gb(need))),
-                     (None, "Queue %s uses %s; its guaranteed share is %s" % (q.path, gb(b["used"][0]),
-                                                                              gb(b["guar"][0]))),
-                     ("ok" if below else None,
-                      "It is below its guaranteed share, so YARN gives it memory first as other containers end "
-                      "(or takes it back from other queues, if preemption is on)" if below else
-                      "It is above its guaranteed share, so it gets more only when other queues leave memory "
-                      "free")],
-            "props": [qprop(q, "capacity"), "yarn.resourcemanager.scheduler.monitor.enable (preemption)"],
-            "fix": ["Wait until containers end.",
-                    "For more room for good: add nodes, or give the queue a bigger guaranteed share (capacity)."]}
+    return {
+        "title": "The cluster is full",
+        "what": [
+            "Queue %s is allowed more, but the memory is not there." % q.path,
+            "Other queues use the rest of the cluster now.",
+        ],
+        "calc": [
+            (None, "Cluster for YARN: %s" % gb(b["total"])),
+            ("no", "Free now: %s, but the %s needs %s" % (gb(b["free"][0]), what, gb(need))),
+            (None, "Queue %s uses %s; its guaranteed share is %s" % (q.path, gb(b["used"][0]), gb(b["guar"][0]))),
+            (
+                "ok" if below else None,
+                "It is below its guaranteed share, so YARN gives it memory first as other containers end "
+                "(or takes it back from other queues, if preemption is on)"
+                if below
+                else "It is above its guaranteed share, so it gets more only when other queues leave memory free",
+            ),
+        ],
+        "props": [qprop(q, "capacity"), "yarn.resourcemanager.scheduler.monitor.enable (preemption)"],
+        "fix": [
+            "Wait until containers end.",
+            "For more room for good: add nodes, or give the queue a bigger guaranteed share (capacity).",
+        ],
+    }
 
 
-def why_user_limit(b, user, need, what, same_u):
+def why_user_limit(b: Balance, user: User, need: float, what: str, same_u: float) -> Why:
     q = b["q"]
     capped = b["ulf"] > 0 and b["ulf"] * b["guar"][0] > b["max"][0]
     name = "A new user" if user["name"] == NEW_USER else user["name"]
+    if b["ulf"] > 0:
+        limit_line = "User limit: user-limit-factor %g x guaranteed %s = %s%s" % (
+            b["ulf"],
+            gb(b["guar"][0]),
+            gb(b["ulf"] * b["guar"][0]),
+            ", cut to the queue max %s" % gb(b["max"][0]) if capped else "",
+        )
+    else:  # -1 (Hadoop 3.3+): no user limit, so one user may use the queue max
+        limit_line = "User limit: user-limit-factor %g means no user limit, so it is the queue max: %s" % (
+            b["ulf"],
+            gb(b["max"][0]),
+        )
     fix = ["Wait until one of this user's apps ends."]
     if b["guar"][0] and b["ulf"] > 0 and not capped:
-        fix.append("Or raise user-limit-factor of queue %s. With %.2f or more, one user may use the whole "
-                   "queue max (%s)." % (q.path, b["max"][0] / b["guar"][0], gb(b["max"][0])))
-    return {"title": "%s has reached its user limit in queue %s" % (who(user).capitalize(), q.path),
-            "what": ["One user's apps together may use only part of a queue.",
-                     "YARN counts per user, not per app: all apps of one account (for example a service "
-                     "account) share this limit."],
-            "calc": [(None, "User limit: user-limit-factor %g x guaranteed %s = %s%s"
-                      % (b["ulf"], gb(b["guar"][0]), gb(b["ulf"] * b["guar"][0]),
-                         ", cut to the queue max %s" % gb(b["max"][0]) if capped else "")),
-                     (None, "%s uses now: %s (all its apps together)" % (name, gb(user["used"] + same_u))),
-                     ("no", "Left: %s, but the %s needs %s" % (gb(max(0, user["limit"] - user["used"] - same_u)),
-                                                              what, gb(need)))],
-            "props": [qprop(q, "user-limit-factor"), qprop(q, "capacity")],
-            "fix": fix}
+        fix.append(
+            "Or raise user-limit-factor of queue %s. With %.2f or more, one user may use the whole "
+            "queue max (%s)." % (q.path, b["max"][0] / b["guar"][0], gb(b["max"][0]))
+        )
+    return {
+        "title": "%s has reached its user limit in queue %s" % (who(user).capitalize(), q.path),
+        "what": [
+            "One user's apps together may use only part of a queue.",
+            "YARN counts per user, not per app: all apps of one account (for example a service "
+            "account) share this limit.",
+        ],
+        "calc": [
+            (None, limit_line),
+            (None, "%s uses now: %s (all its apps together)" % (name, gb(user["used"] + same_u))),
+            (
+                "no",
+                "Left: %s, but the %s needs %s" % (gb(max(0, user["limit"] - user["used"] - same_u)), what, gb(need)),
+            ),
+        ],
+        "props": [qprop(q, "user-limit-factor"), qprop(q, "capacity")],
+        "fix": fix,
+    }
 
 
-def why_am_pool(b, need, what, same_q):
+def why_am_pool(b: Balance, need: float, what: str, same_q: float) -> Why:
     q = b["q"]
     n = (q.live or {}).get("numActiveApplications")
-    calc = [(None, "AM pool: maximum-am-resource-percent %s of the queue = %s"
-             % (pct(b["am_pct"]) if b["am_pct"] else "-", gb(b["am_limit"]))),
-            (None, "Used by the AMs of %s: %s" % ("the %s running apps" % n if n is not None else "the running apps",
-                                                  gb(b["am_used"])))]
+    calc: List[Tuple[Optional[str], str]] = [
+        (
+            None,
+            "AM pool: maximum-am-resource-percent %s of the queue = %s"
+            % (pct(b["am_pct"]) if b["am_pct"] else "-", gb(b["am_limit"])),
+        ),
+        (
+            None,
+            "Used by the AMs of %s: %s"
+            % ("the %s running apps" % n if n is not None else "the running apps", gb(b["am_used"])),
+        ),
+    ]
     if same_q:
         calc.append((None, "Taken by the step above: %s" % gb(same_q)))
-    calc.append(("no", "Free: %s, but the %s needs %s" % (gb(max(0, b["am_limit"] - b["am_used"] - same_q)),
-                                                          what, gb(need))))
-    return {"title": "The AM pool of queue %s is full" % q.path,
-            "what": ["Every YARN app starts with one ApplicationMaster (AM) container.",
-                     "The app waits in ACCEPTED until its AM can start.",
-                     "All AMs in a queue together may use only part of the queue: the AM pool.",
-                     "Each running app holds one AM while it runs (a Spark driver in cluster mode, or an "
-                     "Oozie launcher)."],
-            "calc": calc,
-            "props": [qprop(q, "maximum-am-resource-percent"),
-                      "yarn.scheduler.capacity.maximum-am-resource-percent (the default for all queues)"],
-            "fix": ["Wait until an app in queue %s ends." % q.path,
-                    "Or raise maximum-am-resource-percent of queue %s." % q.path,
-                    "If Oozie launchers use this queue too, give them their own queue "
-                    "(oozie.launcher.default.queue)."]}
+    calc.append(
+        ("no", "Free: %s, but the %s needs %s" % (gb(max(0, b["am_limit"] - b["am_used"] - same_q)), what, gb(need)))
+    )
+    return {
+        "title": "The AM pool of queue %s is full" % q.path,
+        "what": [
+            "Every YARN app starts with one ApplicationMaster (AM) container.",
+            "The app waits in ACCEPTED until its AM can start.",
+            "All AMs in a queue together may use only part of the queue: the AM pool.",
+            "Each running app holds one AM while it runs (a Spark driver in cluster mode, or an Oozie launcher).",
+        ],
+        "calc": calc,
+        "props": [
+            qprop(q, "maximum-am-resource-percent"),
+            "yarn.scheduler.capacity.maximum-am-resource-percent (the default for all queues)",
+        ],
+        "fix": [
+            "Wait until an app in queue %s ends." % q.path,
+            "Or raise maximum-am-resource-percent of queue %s." % q.path,
+            "If Oozie launchers use this queue too, give them their own queue (oozie.launcher.default.queue).",
+        ],
+    }
 
 
-def why_user_am(b, user, need, what, same_u):
+def why_user_am(b: Balance, user: User, need: float, what: str, same_u: float) -> Why:
     q = b["q"]
     guar, pct_am, mulp = b["guar"][0], b["am_pct"], q.min_user_pct
     guess = guar * (pct_am or 0) * max(b["ulf"], 0) * (mulp / 100.0 if mulp < 100 else 1)
     if b["am_limit"]:
         guess = min(guess, b["am_limit"])
     if pct_am and b["ulf"] > 0 and guess and abs(guess - user["am_limit"]) <= 0.15 * user["am_limit"]:
-        how = ("Worked out as: guaranteed %s x maximum-am-resource-percent %s x user-limit-factor %g%s = about %s"
-               % (gb(guar), pct(pct_am), b["ulf"], " x minimum-user-limit-percent %g%%" % mulp if mulp < 100 else "",
-                  gb(guess)))
+        how = "Worked out as: guaranteed %s x maximum-am-resource-percent %s x user-limit-factor %g%s = about %s" % (
+            gb(guar),
+            pct(pct_am),
+            b["ulf"],
+            " x minimum-user-limit-percent %g%%" % mulp if mulp < 100 else "",
+            gb(guess),
+        )
     else:
-        how = ("Worked out by YARN from maximum-am-resource-percent, user-limit-factor and "
-               "minimum-user-limit-percent")
+        how = "Worked out by YARN from maximum-am-resource-percent, user-limit-factor and minimum-user-limit-percent"
     name = "A new user" if user["name"] == NEW_USER else user["name"]
-    calc = [(None, "User AM limit: %s (YARN's figure, userAMResourceLimit)" % gb(user["am_limit"])),
-            (None, how),
-            (None, "%s's AMs now: %s (%s running app%s)" % (name, gb(user["am_used"]), user["apps"],
-                                                           "" if user["apps"] == 1 else "s"))]
+    calc: List[Tuple[Optional[str], str]] = [
+        (None, "User AM limit: %s (YARN's figure, userAMResourceLimit)" % gb(user["am_limit"])),
+        (None, how),
+        (
+            None,
+            "%s's AMs now: %s (%s running app%s)"
+            % (name, gb(user["am_used"]), user["apps"], "" if user["apps"] == 1 else "s"),
+        ),
+    ]
     if same_u:
         calc.append((None, "Taken by the step above: %s" % gb(same_u)))
-    calc.append(("no", "Free: %s, but the %s needs %s" % (gb(max(0, user["am_limit"] - user["am_used"] - same_u)),
-                                                          what, gb(need))))
-    return {"title": "%s has reached its AM limit in queue %s" % (who(user).capitalize(), q.path),
-            "what": ["YARN limits the AMs of each user, not only of the whole queue.",
-                     "All apps of one account share this limit.",
-                     "So one service account can block itself, while the AM pool still has room for other "
-                     "users."],
-            "calc": calc,
-            "props": [qprop(q, "maximum-am-resource-percent"), qprop(q, "user-limit-factor"),
-                      qprop(q, "minimum-user-limit-percent")],
-            "fix": ["Wait until one of this user's apps ends.",
-                    "Or raise user-limit-factor of queue %s." % q.path,
-                    "Or raise maximum-am-resource-percent of queue %s." % q.path,
-                    "Or run some apps under another account: each user has its own AM limit."]}
+    calc.append(
+        (
+            "no",
+            "Free: %s, but the %s needs %s" % (gb(max(0, user["am_limit"] - user["am_used"] - same_u)), what, gb(need)),
+        )
+    )
+    return {
+        "title": "%s has reached its AM limit in queue %s" % (who(user).capitalize(), q.path),
+        "what": [
+            "YARN limits the AMs of each user, not only of the whole queue.",
+            "All apps of one account share this limit.",
+            "So one service account can block itself, while the AM pool still has room for other users.",
+        ],
+        "calc": calc,
+        "props": [
+            qprop(q, "maximum-am-resource-percent"),
+            qprop(q, "user-limit-factor"),
+            qprop(q, "minimum-user-limit-percent"),
+        ],
+        "fix": [
+            "Wait until one of this user's apps ends.",
+            "Or raise user-limit-factor of queue %s." % q.path,
+            "Or raise maximum-am-resource-percent of queue %s." % q.path,
+            "Or run some apps under another account: each user has its own AM limit.",
+        ],
+    }
 
 
-def why_node(b, need, what, biggest, free_total):
-    return {"title": "No single node has room for the %s" % what,
-            "what": ["A container must fit on one node; YARN cannot split it.",
-                     "There is free memory, but it is spread over the nodes in pieces that are too small."],
-            "calc": [(None, "Free in the whole cluster: %s" % gb(free_total)),
-                     ("no", "The most free on one node: %s, but the %s needs %s" % (gb(biggest), what, gb(need)))],
-            "props": ["yarn.nodemanager.resource.memory-mb (memory per node)",
-                      "spark.executor.memory, spark.driver.memory / spark.yarn.am.memory (container sizes)"],
-            "fix": ["Wait until containers end on one of the nodes.",
-                    "Or use smaller containers (less memory per executor or AM)."]}
+def why_node(b: Balance, need: float, what: str, biggest: float, free_total: float) -> Why:
+    return {
+        "title": "No single node has room for the %s" % what,
+        "what": [
+            "A container must fit on one node; YARN cannot split it.",
+            "There is free memory, but it is spread over the nodes in pieces that are too small.",
+        ],
+        "calc": [
+            (None, "Free in the whole cluster: %s" % gb(free_total)),
+            ("no", "The most free on one node: %s, but the %s needs %s" % (gb(biggest), what, gb(need))),
+        ],
+        "props": [
+            "yarn.nodemanager.resource.memory-mb (memory per node)",
+            "spark.executor.memory, spark.driver.memory / spark.yarn.am.memory (container sizes)",
+        ],
+        "fix": [
+            "Wait until containers end on one of the nodes.",
+            "Or use smaller containers (less memory per executor or AM).",
+        ],
+    }
 
 
-def am_step(b, user, size, what, taken, nodes):
+def am_step(
+    b: Balance, user: Optional[User], size: float, what: str, taken: List[Tuple[str, float]], nodes: List[float]
+) -> Tuple[bool, List[Check], float, Tuple[str, Any]]:
     """Checks for one AM container of `size` in queue b, after the earlier steps in `taken`.
     nodes: the free memory of each node, changed in place when the container fits.
     Returns (ok, [(ok, short text, explanation)], room left after it, what sets that room)."""
     q = b["q"]
-    same_q = sum(m for path, m in taken if path == q.path)                  # earlier AMs in this queue
+    same_q = sum(m for path, m in taken if path == q.path)  # earlier AMs in this queue
     same_u = sum(m for path, m in taken if path == q.path and user is not None)  # ... of the same user
     pre = "%s: " % what
-    checks = [(q.state == "RUNNING", pre + ("queue %s is RUNNING" % q.path if q.state == "RUNNING"
-                                            else "queue %s is %s: it takes no new apps" % (q.path, q.state)),
-               {"title": "Queue %s is %s" % (q.path, q.state),
+    checks = [
+        (
+            q.state == "RUNNING",
+            pre
+            + (
+                "queue %s is RUNNING" % q.path
+                if q.state == "RUNNING"
+                else "queue %s is %s: it takes no new apps" % (q.path, q.state)
+            ),
+            {
+                "title": "Queue %s is %s" % (q.path, q.state),
                 "what": ["A queue that is not RUNNING takes no new apps.", "Apps that already run go on."],
-                "calc": [("no", "State of queue %s: %s" % (q.path, q.state))], "props": [qprop(q, "state")],
-                "fix": ["Ask the admin to set it to RUNNING and run yarn rmadmin -refreshQueues.",
-                        "Or submit to another queue (spark-submit --queue)."]})]
+                "calc": [("no", "State of queue %s: %s" % (q.path, q.state))],
+                "props": [qprop(q, "state")],
+                "fix": [
+                    "Ask the admin to set it to RUNNING and run yarn rmadmin -refreshQueues.",
+                    "Or submit to another queue (spark-submit --queue).",
+                ],
+            },
+        )
+    ]
     after = " after the %s above" % gb(same_q) if same_q else ""
     if b["am_limit"] is not None:
         left = b["am_limit"] - b["am_used"] - same_q
-        checks.append((left >= size, pre + "AM pool of %s: %s free%s, needs %s"
-                       % (q.path, gb(max(0, left)), after, gb(size)), why_am_pool(b, size, what, same_q)))
+        checks.append(
+            (
+                left >= size,
+                pre + "AM pool of %s: %s free%s, needs %s" % (q.path, gb(max(0, left)), after, gb(size)),
+                why_am_pool(b, size, what, same_q),
+            )
+        )
     if user is not None and user["am_limit"]:
         left = user["am_limit"] - user["am_used"] - same_u
-        checks.append((left >= size, pre + "AM limit of %s: %s free%s, needs %s"
-                       % (who(user), gb(max(0, left)), after, gb(size)), why_user_am(b, user, size, what, same_u)))
+        checks.append(
+            (
+                left >= size,
+                pre + "AM limit of %s: %s free%s, needs %s" % (who(user), gb(max(0, left)), after, gb(size)),
+                why_user_am(b, user, size, what, same_u),
+            )
+        )
     room, scope = room_after(b, taken)
-    checks.append((room >= size, pre + "room for queue %s now: %s, needs %s" % (q.path, gb(room), gb(size)),
-                   why_room(b, scope, size, what)))
+    checks.append(
+        (
+            room >= size,
+            pre + "room for queue %s now: %s, needs %s" % (q.path, gb(room), gb(size)),
+            why_room(b, scope, size, what),
+        )
+    )
     biggest = max(nodes or [0])
-    checks.append((biggest >= size, pre + "the most free on one node: %s (a container must fit on one node)"
-                   % gb(biggest), why_node(b, size, what, biggest, sum(nodes or [0]))))
-    room_by = ("room", scope)
+    checks.append(
+        (
+            biggest >= size,
+            pre + "the most free on one node: %s (a container must fit on one node)" % gb(biggest),
+            why_node(b, size, what, biggest, sum(nodes or [0])),
+        )
+    )
+    room_by: Tuple[str, Any] = ("room", scope)
     if user is not None and user["limit"]:
         user_left = user["limit"] - user["used"] - same_u
-        checks.append((user_left >= size, pre + "user limit of %s in %s: %s left (limit %s, uses %s)"
-                       % (user["name"], q.path, gb(max(0, user_left)), gb(user["limit"]), gb(user["used"] + same_u)),
-                       why_user_limit(b, user, size, what, same_u)))
+        checks.append(
+            (
+                user_left >= size,
+                pre
+                + "user limit of %s in %s: %s left (limit %s, uses %s)"
+                % (user["name"], q.path, gb(max(0, user_left)), gb(user["limit"]), gb(user["used"] + same_u)),
+                why_user_limit(b, user, size, what, same_u),
+            )
+        )
         if user_left < room:
             room, room_by = user_left, ("user", user)
     ok = all(c for c, _, _ in checks)
@@ -1555,7 +2044,9 @@ def am_step(b, user, size, what, taken, nodes):
     return ok, checks, room - size, room_by
 
 
-def executors_fit(b, room_left, nodes, room_by, same_u=0):
+def executors_fit(
+    b: Balance, room_left: float, nodes: List[float], room_by: Tuple[str, Any], same_u: float = 0
+) -> Tuple[int, Optional[Why]]:
     """How many executors fit now, and if none: the explanation of what stops them."""
     size = b["executor_size"]
     if not size:
@@ -1572,7 +2063,7 @@ def executors_fit(b, room_left, nodes, room_by, same_u=0):
     return 0, why_node(b, size, what, max(nodes or [0]), sum(nodes or [0]))
 
 
-def new_app_check(b, user=None):
+def new_app_check(b: Balance, user: Optional[User] = None) -> Tuple[bool, List[Check], int, Optional[Why]]:
     """Can a new Spark app (spark-submit) start in the queue now?
     Returns (yes, [(ok, text, explanation)], executors, explanation when no executor fits)."""
     nodes = list(b["nodes_free"])
@@ -1583,7 +2074,9 @@ def new_app_check(b, user=None):
     return True, checks, n, why
 
 
-def oozie_check(b_launch, b_spark, name, launcher_size):
+def oozie_check(
+    b_launch: Balance, b_spark: Balance, name: Optional[str], launcher_size: float
+) -> Tuple[bool, Optional[str], List[Check], int, Optional[Why]]:
     """Can a Spark action of an Oozie workflow start now? The launcher AM starts first in the launcher queue
     and stays until the Spark job ends; then the Spark AM must fit as well.
     Returns (yes, failed step or None, [(ok, text, explanation)], executors, explanation when none fit)."""
@@ -1592,8 +2085,7 @@ def oozie_check(b_launch, b_spark, name, launcher_size):
     if not ok1:
         return False, "launcher", checks1, 0, None
     taken = [(b_launch["q"].path, launcher_size)]
-    ok2, checks2, left, room_by = am_step(b_spark, user_in(b_spark, name), b_spark["am_size"], "Spark AM",
-                                          taken, nodes)
+    ok2, checks2, left, room_by = am_step(b_spark, user_in(b_spark, name), b_spark["am_size"], "Spark AM", taken, nodes)
     if not ok2:
         return False, "spark", checks1 + checks2, 0, None
     same_u = sum(m for path, m in taken if path == b_spark["q"].path) + b_spark["am_size"]
@@ -1604,7 +2096,9 @@ def oozie_check(b_launch, b_spark, name, launcher_size):
 LEDGER_W = 54
 
 
-def ledger(label, amount, vcores=None, sign=" ", role=None, note=""):
+def ledger(
+    label: str, amount: str, vcores: Optional[str] = None, sign: str = " ", role: Optional[str] = None, note: str = ""
+) -> None:
     """One line of a balance sheet: sign, label, memory and vcores right-aligned, then a note."""
     sign = {"-": BOX["minus"], "=": "="}.get(sign, sign)
     if len(label) > LEDGER_W:  # a long label gets its own line, so the numbers stay in their columns
@@ -1615,23 +2109,41 @@ def ledger(label, amount, vcores=None, sign=" ", role=None, note=""):
     print(line + ("  " + paint(note, "bad") if note else ""))
 
 
-def rule(vcores=True):
-    print(("      %-*s %s %s" % (LEDGER_W, "", paint(BOX["line"] * 11, "rule"),
-                                 paint(BOX["line"] * 9, "rule") if vcores else "")).rstrip())
+def rule(vcores: bool = True) -> None:
+    print(
+        (
+            "      %-*s %s %s"
+            % (LEDGER_W, "", paint(BOX["line"] * 11, "rule"), paint(BOX["line"] * 9, "rule") if vcores else "")
+        ).rstrip()
+    )
 
 
-def vc(n):
+def vc(n: Optional[float]) -> str:
     return "-" if n is None else "%g" % round(n, 1)
 
 
-def print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie=None):
+def print_balance(
+    b: Balance,
+    spark_queue: Optional[Queue],
+    launcher_queue: Optional[Queue],
+    uses_vcores: bool,
+    oozie: Optional[Tuple[Balance, float]] = None,
+) -> None:
     q = b["q"]
     roles = [r for r, x in (("Spark", spark_queue), ("Oozie", launcher_queue)) if x is q]
     print("  " + paint("Queue %s" % q.path, "queue") + (" (%s)" % ", ".join(roles) if roles else ""))
     print("    " + paint("How to read it:", "label"))
-    bullets(["What the queue may use.", "Minus what is used now.", "Equals what is left.",
-             "Can a new app start now? If not: which limit stops it, the numbers, the setting behind it, "
-             "and what you can do."], "      ", numbered=True)
+    bullets(
+        [
+            "What the queue may use.",
+            "Minus what is used now.",
+            "Equals what is left.",
+            "Can a new app start now? If not: which limit stops it, the numbers, the setting behind it, "
+            "and what you can do.",
+        ],
+        "      ",
+        numbered=True,
+    )
     print()
     print("      %-*s %11s %9s" % (LEDGER_W, "", paint("   Memory", "label"), paint("   vcores", "label")))
     ledger("Cluster for YARN, all running nodes", gb(b["total"]), vc(b["total_vc"]))
@@ -1651,32 +2163,60 @@ def print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie=None):
         rule()
         ledger("(%s) Left under the parent max" % letters[i], gb(pleft[0]), vc(pleft[1]), sign="=")
     last = letters[len(b["parents"])]
-    ledger("(%s) Free in the whole cluster now" % last, gb(b["free"][0]),
-           vc(b["free"][1]))
+    ledger("(%s) Free in the whole cluster now" % last, gb(b["free"][0]), vc(b["free"][1]))
     rule()
-    ledger("Room for this queue now: the smallest of (a)%s" % ("" if last == "b" else "..") + "(%s)" % last,
-           gb(b["room"]), vc(b["room_vc"]), sign="=", role="value",
-           note="%s set by %s" % (BOX["arrow"], b["room_by"]))
+    ledger(
+        "Room for this queue now: the smallest of (a)%s" % ("" if last == "b" else "..") + "(%s)" % last,
+        gb(b["room"]),
+        vc(b["room_vc"]),
+        sign="=",
+        role="value",
+        note="%s set by %s" % (BOX["arrow"], b["room_by"]),
+    )
     if not uses_vcores:
-        print(paint(wrap("vcores are shown, but YARN does not limit by them here: the resource calculator "
-                         "counts memory only (yarn.scheduler.capacity.resource-calculator).", "      "), "default"))
+        print(
+            paint(
+                wrap(
+                    "vcores are shown, but YARN does not limit by them here: the resource calculator "
+                    "counts memory only (yarn.scheduler.capacity.resource-calculator).",
+                    "      ",
+                ),
+                "default",
+            )
+        )
 
     if b["am_limit"] is not None:
         print()
         print("    " + paint("AM pool: each new app needs room for its ApplicationMaster here", "label"))
-        ledger("AM pool (maximum-am-resource-percent %s)" % (pct(b["am_pct"]) if b["am_pct"] else "-"),
-               gb(b["am_limit"]))
+        ledger(
+            "AM pool (maximum-am-resource-percent %s)" % (pct(b["am_pct"]) if b["am_pct"] else "-"), gb(b["am_limit"])
+        )
         ledger("Used by the AMs of the running apps", gb(b["am_used"]), sign="-")
         rule(vcores=False)
         left = b["am_limit"] - b["am_used"]
         n = int(max(0, left) // b["am_size"]) if b["am_size"] else 0
-        ledger("Free in the AM pool", gb(left), sign="=", role="value" if n else "bad",
-               note="" if n else "%s full: new apps wait in ACCEPTED" % BOX["arrow"])
-        print(highlight("      That is room for %d more Spark AM%s of %s (one AM per app)."
-                        % (n, "" if n == 1 else "s", mb(b["am_size"]))))
+        ledger(
+            "Free in the AM pool",
+            gb(left),
+            sign="=",
+            role="value" if n else "bad",
+            note="" if n else "%s full: new apps wait in ACCEPTED" % BOX["arrow"],
+        )
+        print(
+            highlight(
+                "      That is room for %d more Spark AM%s of %s (one AM per app)."
+                % (n, "" if n == 1 else "s", mb(b["am_size"]))
+            )
+        )
         if b["user_am_limit"]:
-            print(highlight(wrap("Each user may use at most %s of the AM pool (userAMResourceLimit)."
-                                 % gb(b["user_am_limit"]), "      ")))
+            print(
+                highlight(
+                    wrap(
+                        "Each user may use at most %s of the AM pool (userAMResourceLimit)." % gb(b["user_am_limit"]),
+                        "      ",
+                    )
+                )
+            )
 
     if b["users"]:
         print()
@@ -1685,19 +2225,44 @@ def print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie=None):
         for u in b["users"]:
             left = u["limit"] - u["used"] if u["limit"] else None
             am_left = u["am_limit"] - u["am_used"] if u["am_limit"] else None
-            rows.append([u["name"], "%s / %s" % (u["apps"], u["waiting"]), gb(u["limit"]), gb(u["used"]),
-                         gb(left), gb(u["am_limit"]), gb(u["am_used"]), gb(am_left)])
-        table(["User", "Run / wait", "User limit", "Used", "Left", "AM limit", "AM used", "AM left"], rows,
-              indent="      ", roles=["queue", None, None, None, lambda c: "bad" if c.startswith("0.00") or
-                                         c.startswith("-") and c != "-" else None, None, None,
-                                         lambda c: "bad" if c.startswith("0.00") or c.startswith("-") and
-                                         c != "-" else None])
-        notes = ["User limit: the most one user may use in this queue.",
-                 "It is user-limit-factor %g x guaranteed %s, at most the queue max." % (b["ulf"], gb(b["guar"][0]))
-                 if b["ulf"] > 0 else "user-limit-factor %g means no user limit, so it is the queue max." % b["ulf"]]
+            rows.append(
+                [
+                    u["name"],
+                    "%s / %s" % (u["apps"], u["waiting"]),
+                    gb(u["limit"]),
+                    gb(u["used"]),
+                    gb(left),
+                    gb(u["am_limit"]),
+                    gb(u["am_used"]),
+                    gb(am_left),
+                ]
+            )
+        table(
+            ["User", "Run / wait", "User limit", "Used", "Left", "AM limit", "AM used", "AM left"],
+            rows,
+            indent="      ",
+            roles=[
+                "queue",
+                None,
+                None,
+                None,
+                lambda c: "bad" if c.startswith("0.00") or c.startswith("-") and c != "-" else None,
+                None,
+                None,
+                lambda c: "bad" if c.startswith("0.00") or c.startswith("-") and c != "-" else None,
+            ],
+        )
+        notes = [
+            "User limit: the most one user may use in this queue.",
+            "It is user-limit-factor %g x guaranteed %s, at most the queue max." % (b["ulf"], gb(b["guar"][0]))
+            if b["ulf"] > 0
+            else "user-limit-factor %g means no user limit, so it is the queue max." % b["ulf"],
+        ]
         if len(b["users"]) > 1 and b["q"].min_user_pct < 100:
-            notes.append("When several users want more at the same time, YARN also splits the queue between "
-                         "them (minimum-user-limit-percent %g%%), so each may get less." % b["q"].min_user_pct)
+            notes.append(
+                "When several users want more at the same time, YARN also splits the queue between "
+                "them (minimum-user-limit-percent %g%%), so each may get less." % b["q"].min_user_pct
+            )
         bullets(notes, "      ")
 
     print()
@@ -1706,7 +2271,7 @@ def print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie=None):
     if oozie:  # the users of the launcher queue may start workflows too
         users += [u for u in oozie[0]["users"] if all(u["name"] != w["name"] for w in users)]
     users = users or [None]
-    seen = set()
+    seen: Set[str] = set()
     for user in users:
         name = user["name"] if user else None
         mine = user_in(b, name)
@@ -1714,65 +2279,108 @@ def print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie=None):
         print()
         print("      " + paint("As %s, with spark-submit:" % who(mine), "label"))
         print_checks(checks)
-        print_verdict(yes, executors, b["executor_size"],
-                      ["it waits in ACCEPTED.", "ACCEPTED means: YARN has the app, but does not start it yet."],
-                      checks, why_exec, seen)
+        print_verdict(
+            yes,
+            executors,
+            b["executor_size"],
+            ["it waits in ACCEPTED.", "ACCEPTED means: YARN has the app, but does not start it yet."],
+            checks,
+            why_exec,
+            seen,
+        )
         if oozie:
             b_launch, launcher_size = oozie
             same = b_launch["q"] is b["q"]
             print()
-            print(paint(wrap("As %s, " % who(mine) +
-                             "from an Oozie workflow: first the launcher (%s, queue %s), then the Spark AM%s:"
-                             % (mb(launcher_size), b_launch["q"].path, " in the same queue" if same else ""),
-                             "      ", "      "), "label"))
+            print(
+                paint(
+                    wrap(
+                        "As %s, " % who(mine)
+                        + "from an Oozie workflow: first the launcher (%s, queue %s), then the Spark AM%s:"
+                        % (mb(launcher_size), b_launch["q"].path, " in the same queue" if same else ""),
+                        "      ",
+                        "      ",
+                    ),
+                    "label",
+                )
+            )
             yes, failed, checks, executors, why_exec = oozie_check(b_launch, b, name, launcher_size)
             print_checks(checks)
             both = launcher_size + b["am_size"]
-            limits = [(lim, text) for lim, text in ((user_in(b, name)["am_limit"], "the AM limit of one user"),
-                                                    (b["am_limit"], "the AM pool of the queue")) if lim]
+            limits = [
+                (lim, text)
+                for lim, text in (
+                    (user_in(b, name)["am_limit"], "the AM limit of one user"),
+                    (b["am_limit"], "the AM pool of the queue"),
+                )
+                if lim
+            ]
             never = [(lim, text) for lim, text in limits if same and both > lim]
             if never:
-                why_not = ["it can NEVER start.",
-                           "The launcher and the Spark AM together need %s." % gb(both),
-                           "That is more than %s (%s), even when nothing else runs." % (never[0][1],
-                                                                                       gb(never[0][0])),
-                           "So the launcher starts, and then waits for good.",
-                           "Best fix: give the launchers their own queue (oozie.launcher.default.queue)."]
+                why_not = [
+                    "it can NEVER start.",
+                    "The launcher and the Spark AM together need %s." % gb(both),
+                    "That is more than %s (%s), even when nothing else runs." % (never[0][1], gb(never[0][0])),
+                    "So the launcher starts, and then waits for good.",
+                    "Best fix: give the launchers their own queue (oozie.launcher.default.queue).",
+                ]
             elif failed == "launcher":
-                why_not = ["the launcher waits in ACCEPTED.",
-                           "ACCEPTED means: YARN has the app, but does not start it yet."]
+                why_not = [
+                    "the launcher waits in ACCEPTED.",
+                    "ACCEPTED means: YARN has the app, but does not start it yet.",
+                ]
             else:
-                why_not = ["the launcher starts, but the Spark AM waits in ACCEPTED.",
-                           "The launcher keeps its %s while it waits." % mb(launcher_size),
-                           "So the workflow hangs until the limit below frees up."]
+                why_not = [
+                    "the launcher starts, but the Spark AM waits in ACCEPTED.",
+                    "The launcher keeps its %s while it waits." % mb(launcher_size),
+                    "So the workflow hangs until the limit below frees up.",
+                ]
             print_verdict(yes, executors, b["executor_size"], why_not, checks, why_exec, seen)
     if not b["users"]:
-        print(highlight(wrap("No user has apps in this queue now, so the check is for a user that starts "
-                             "fresh (user limit %s)." % gb(b["one_user"]), "      ")))
+        print(
+            highlight(
+                wrap(
+                    "No user has apps in this queue now, so the check is for a user that starts "
+                    "fresh (user limit %s)." % gb(b["one_user"]),
+                    "      ",
+                )
+            )
+        )
     print()
 
 
-def print_checks(checks):
+def print_checks(checks: List[Check]) -> None:
     for ok, text, _ in checks:
-        print("        " + (paint(MARK_OK, "good") if ok else paint(BOX["no"], "bad")) + " " + highlight(text))
+        print("        " + mark("ok" if ok else "no") + " " + highlight(text))
 
 
-def mark(kind):
-    """✓ for ok, ✗ for not enough, a bullet for a plain fact."""
-    return {"ok": paint(MARK_OK, "good"), "no": paint(BOX["no"], "bad")}.get(kind, BOX["bullet"])
+# All marks take the same width, so the text after them lines up. On an ASCII terminal "OK" is two
+# characters while "X" and "*" are one.
+MARK_W = max(len(MARK_OK), len(BOX["no"]), len(BOX["bullet"]))
 
 
-def bullets(items, ind, numbered=False):
+def mark(kind: Optional[str]) -> str:
+    """✓ for ok, ✗ for not enough, a bullet for a plain fact; padded to MARK_W."""
+    if kind == "ok":
+        text, role = MARK_OK, "good"
+    elif kind == "no":
+        text, role = BOX["no"], "bad"
+    else:
+        text, role = BOX["bullet"], ""
+    return paint(text, role) + " " * (MARK_W - len(text))
+
+
+def bullets(items: Sequence[Union[str, Tuple[Optional[str], str]]], ind: str, numbered: bool = False) -> None:
     """Print a list: each item on its own line(s), with a mark, a bullet or a number."""
     for i, item in enumerate(items, 1):
         kind, text = item if isinstance(item, tuple) else (None, item)
         head = "%d." % i if numbered else mark(kind)
-        width = len("%d." % i) if numbered else 1
+        width = len("%d." % i) if numbered else MARK_W
         line = wrap(text, ind + "x" * width + " ", ind + " " * (width + 1))
-        print(ind + head + highlight(line[len(ind) + width:]))
+        print(ind + head + highlight(line[len(ind) + width :]))
 
 
-def print_why(why, also=(), seen=None):
+def print_why(why: Why, also: Sequence[str] = (), seen: Optional[Set[str]] = None) -> None:
     """The plain explanation of the limit that stops an app, as short lists.
     seen: the explanations already given in this sheet; their "what it is" part is not repeated."""
     ind, sub = "          ", "            "
@@ -1796,7 +2404,15 @@ def print_why(why, also=(), seen=None):
         bullets([("no", t) for t in also], sub)
 
 
-def print_verdict(yes, executors, executor_size, why_not, checks, why_exec=None, seen=None):
+def print_verdict(
+    yes: bool,
+    executors: int,
+    executor_size: int,
+    why_not: List[str],
+    checks: List[Check],
+    why_exec: Optional[Why] = None,
+    seen: Optional[Set[str]] = None,
+) -> None:
     """why_not: the headline when the app cannot start, then more lines, shown as bullets."""
     ind = "        "
     if not yes:
@@ -1806,9 +2422,15 @@ def print_verdict(yes, executors, executor_size, why_not, checks, why_exec=None,
         print_why(failed[0], [w["title"] for w in failed[1:]], seen)
         return
     if executors:
-        print(ind + paint(MARK_OK + " YES: it starts now, and about %d executor%s of %s fit%s right away."
-                          % (executors, "" if executors == 1 else "s", mb(executor_size),
-                             "s" if executors == 1 else ""), "good"))
+        print(
+            ind
+            + paint(
+                MARK_OK
+                + " YES: it starts now, and about %d executor%s of %s fit%s right away."
+                % (executors, "" if executors == 1 else "s", mb(executor_size), "s" if executors == 1 else ""),
+                "good",
+            )
+        )
         return
     print(ind + paint(MARK_OK + " YES, it starts, but:", "good"))
     bullets([("no", "no executor of %s fits right away, so its tasks wait." % mb(executor_size))], ind + "  ")
@@ -1816,12 +2438,12 @@ def print_verdict(yes, executors, executor_size, why_not, checks, why_exec=None,
         print_why(why_exec, seen=seen)
 
 
-def short_reason(text):
+def short_reason(text: str) -> str:
     """'Spark AM: AM pool of root.default: 0.00 GB free' -> 'Spark AM: AM pool of root.default'"""
     return ": ".join(text.split(": ")[:2])
 
 
-def launcher_size(files, min_alloc):
+def launcher_size(files: Dict[str, ConfigFile], min_alloc: float) -> Optional[int]:
     """The memory of one Oozie launcher in YARN (rounded like any container), or None without oozie-site.xml."""
     if files["oozie"].props is None:
         return None
@@ -1829,50 +2451,100 @@ def launcher_size(files, min_alloc):
     return int(math.ceil(raw / float(min_alloc)) * min_alloc)
 
 
-def print_balances(queues, live, spark_queue, launcher_queue, am, executor, uses_vcores, only=None, full=True,
-                   launcher_size=None):
+def print_balances(
+    queues: Dict[str, Queue],
+    live: Live,
+    spark_queue: Optional[Queue],
+    launcher_queue: Optional[Queue],
+    am: Container,
+    executor: Container,
+    uses_vcores: bool,
+    only: Optional[List[str]] = None,
+    full: bool = True,
+    launcher_size: Optional[int] = None,
+) -> None:
     """The room of each queue in numbers: an overview table, then a balance sheet per queue."""
     balances = [b for b in (queue_balance(queues[p], live, am.size, executor.size) for p in sorted(queues)) if b]
     if not balances:
         return
-    section("Queue room in numbers",
-            "What each queue may use, what it uses now and what is left, in GB (1 GB = 1,024 MB) and vcores. "
-            "A snapshot: containers end every few seconds." + (" The balance sheets below show how each "
-                                                              "number is worked out." if full else ""))
+    section(
+        "Queue room in numbers",
+        "What each queue may use, what it uses now and what is left, in GB (1 GB = 1,024 MB) and vcores. "
+        "A snapshot: containers end every few seconds."
+        + (" The balance sheets below show how each number is worked out." if full else ""),
+    )
     b_launch = next((b for b in balances if b["q"] is launcher_queue), None) if launcher_queue else None
     oozie = (b_launch, launcher_size) if b_launch and launcher_size else None
-    rows = []
+    rows: List[List[str]] = []
     for b in balances:
         top = max(b["users"], key=lambda u: u["used"]) if b["users"] else user_in(b, None)
         yes, checks, _, _ = new_app_check(b, top)
-        row = [b["q"].path, gb(b["guar"][0]), gb(b["max"][0]), gb(b["used"][0]), gb(b["room"]),
-               gb(b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else "-",
-               "yes" if yes else "NO: " + short_reason(next(t for ok, t, _ in checks if not ok))]
+        row = [
+            b["q"].path,
+            gb(b["guar"][0]),
+            gb(b["max"][0]),
+            gb(b["used"][0]),
+            gb(b["room"]),
+            gb(b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else "-",
+            "yes" if yes else "NO: " + short_reason(next(t for ok, t, _ in checks if not ok)),
+        ]
         if oozie:
-            yes, _, checks, _, _ = oozie_check(b_launch, b, top["name"] if b["users"] else None, launcher_size)
+            yes, _, checks, _, _ = oozie_check(oozie[0], b, top["name"] if b["users"] else None, oozie[1])
             row.append("yes" if yes else "NO: " + short_reason(next(t for ok, t, _ in checks if not ok)))
         rows.append(row)
     headers = ["Queue", "Guaranteed", "Max", "Used", "Room now", "AM pool free", "spark-submit now?"]
-    verdict = lambda c: "good" if c == "yes" else "bad"  # noqa: E731
-    table(headers + (["From Oozie now?"] if oozie else []), rows,
-          roles=["queue", None, None, None, "value", None, verdict, verdict])
-    print(highlight(wrap("Checked for the user that uses the most of each queue (or a fresh user)." +
-                         (" From Oozie: the launcher (%s) starts first in %s and stays, then the Spark AM must "
-                          "fit too." % (mb(launcher_size), b_launch["q"].path) if oozie else ""), "  ")))
+
+    def verdict(c: str) -> str:
+        return "good" if c == "yes" else "bad"
+
+    table(
+        headers + (["From Oozie now?"] if oozie else []),
+        rows,
+        roles=["queue", None, None, None, "value", None, verdict, verdict],
+    )
+    print(
+        highlight(
+            wrap(
+                "Checked for the user that uses the most of each queue (or a fresh user)."
+                + (
+                    " From Oozie: the launcher (%s) starts first in %s and stays, then the Spark AM must "
+                    "fit too." % (mb(oozie[1]), oozie[0]["q"].path)
+                    if oozie
+                    else ""
+                ),
+                "  ",
+            )
+        )
+    )
     if not full:
         return
     if only:
         chosen = [b for b in balances if any(b["q"] is find_queue(queues, n) for n in only)]
     else:
-        chosen = [b for b in balances if b["q"] in (spark_queue, launcher_queue) or b["users"]
-                  or (b["q"].live or {}).get("numPendingApplications")]
+        chosen = [
+            b
+            for b in balances
+            if b["q"] in (spark_queue, launcher_queue)
+            or b["users"]
+            or (b["q"].live or {}).get("numPendingApplications")
+        ]
     print()
     if not chosen:
-        print(highlight(wrap("No balance sheet: no queue is Spark's or has apps now. Use --queue NAME to "
-                             "show one.", "  ")))
+        print(
+            highlight(
+                wrap("No balance sheet: no queue is Spark's or has apps now. Use --queue NAME to show one.", "  ")
+            )
+        )
         return
-    print(highlight(wrap("Balance sheets for %s. Use --queue NAME (more than once) to pick others."
-                         % ", ".join(b["q"].path for b in chosen), "  ")))
+    print(
+        highlight(
+            wrap(
+                "Balance sheets for %s. Use --queue NAME (more than once) to pick others."
+                % ", ".join(b["q"].path for b in chosen),
+                "  ",
+            )
+        )
+    )
     print()
     for b in chosen:
         print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie)
@@ -1890,7 +2562,7 @@ WAIT_REASONS = [
 ]
 
 
-def wait_reason(app):
+def wait_reason(app: Json) -> Tuple[str, str]:
     """Return (short reason, cleaned YARN diagnostics) for an app in ACCEPTED."""
     text = re.sub(r"\[[^\]]*\d{4}\]\s*", "", app.get("diagnostics") or "")  # drop the timestamps
     text = " ".join(text.split())
@@ -1901,7 +2573,7 @@ def wait_reason(app):
     return (text[:40] + "..." if len(text) > 40 else text) or "no reason given by YARN", text
 
 
-def elapsed(ms):
+def elapsed(ms: Any) -> str:
     try:
         sec = int(ms) // 1000
     except (TypeError, ValueError):
@@ -1911,7 +2583,7 @@ def elapsed(ms):
     return "%dm%02ds" % (sec // 60, sec % 60)
 
 
-def doing_now(app):
+def doing_now(app: Json) -> str:
     """What one app does now, in a few words."""
     if app.get("state") == "ACCEPTED":
         return "waiting: " + wait_reason(app)[0]
@@ -1921,32 +2593,38 @@ def doing_now(app):
         text = "Oozie launcher: waits for its child job"
     elif stages:
         st = sorted(stages, key=lambda x: x.get("stageId", 0))[0]
-        text = "stage %s %s: %s/%s tasks" % (st.get("stageId", "?"), " ".join(str(st.get("name", "")).split()[:3]),
-                                             st.get("numCompleteTasks", "?"), st.get("numTasks", "?"))
+        text = "stage %s %s: %s/%s tasks" % (
+            st.get("stageId", "?"),
+            " ".join(str(st.get("name", "")).split()[:3]),
+            st.get("numCompleteTasks", "?"),
+            st.get("numTasks", "?"),
+        )
         if len(stages) > 1:
             text += " (+%d more stage%s)" % (len(stages) - 1, "" if len(stages) == 2 else "s")
     elif stages == []:
         text = "no stage runs now (driver code, or between jobs)"
     else:
-        try:
-            text = "%.0f%% done (YARN progress)" % float(app.get("progress"))
-        except (TypeError, ValueError):
-            text = "-"
+        progress = to_float(app.get("progress"))
+        text = "%.0f%% done (YARN progress)" % progress if progress is not None else "-"
     count = pending_request(app)[0]
     if count:  # it asks YARN for more and does not have it yet; the reason is listed below the table
-        text += " %s wants %s" % (DOT, "%d more container%s" % (count, "" if count == 1 else "s") if count > 0
-                                  else "more memory")
+        text += " %s wants %s" % (
+            DOT,
+            "%d more container%s" % (count, "" if count == 1 else "s") if count > 0 else "more memory",
+        )
     return text
 
-def why_no_resources(app, live, queues):
+
+def why_no_resources(app: Json, live: Live, queues: Dict[str, Queue]) -> Optional[str]:
     """Explain in plain words why a running app does not get what it asks for. None if it gets it."""
     apps = live.get("apps") or []
     total = to_float(live["metrics"].get("totalMB")) or 0
     free_total = to_float(live["metrics"].get("availableMB")) or 0
     nodes = [n for n in live.get("nodes") or [] if n.get("state") == "RUNNING"]
     node_free = max([to_float(n.get("availMemoryMB")) or 0 for n in nodes] or [0])
-    node_size = max([(to_float(n.get("usedMemoryMB")) or 0) + (to_float(n.get("availMemoryMB")) or 0)
-                     for n in nodes] or [0])
+    node_size = max(
+        [(to_float(n.get("usedMemoryMB")) or 0) + (to_float(n.get("availMemoryMB")) or 0) for n in nodes] or [0]
+    )
     count, size = pending_request(app)
     q = find_queue(queues, str(app.get("queue", ""))) if queues else None
 
@@ -1957,74 +2635,113 @@ def why_no_resources(app, live, queues):
             return None
         executors = max(0, int(to_float(app.get("runningContainers")) or 1) - 1)
         if conf.get("spark.dynamicAllocation.enabled", "false").lower() != "true":
-            return ("%d tasks wait, but the app does not ask YARN for more: dynamic allocation is off, so it "
-                    "keeps its %s executors (spark.executor.instances). Give more with --num-executors, or "
-                    "turn on dynamic allocation." % (left, conf.get("spark.executor.instances", "2 (default)")))
+            return (
+                "%d tasks wait, but the app does not ask YARN for more: dynamic allocation is off, so it "
+                "keeps its %s executors (spark.executor.instances). Give more with --num-executors, or "
+                "turn on dynamic allocation." % (left, conf.get("spark.executor.instances", "2 (default)"))
+            )
         cap = conf.get("spark.dynamicAllocation.maxExecutors")
         if cap and executors >= int(to_float(cap) or 0):
-            return ("%d tasks wait, but the app does not ask YARN for more: it already has %d executor%s, its own "
-                    "limit (spark.dynamicAllocation.maxExecutors = %s). YARN is not the cause. Raise the limit "
-                    "for this app if the cluster has room." % (left, executors, "" if executors == 1 else "s", cap))
+            return (
+                "%d tasks wait, but the app does not ask YARN for more: it already has %d executor%s, its own "
+                "limit (spark.dynamicAllocation.maxExecutors = %s). YARN is not the cause. Raise the limit "
+                "for this app if the cluster has room." % (left, executors, "" if executors == 1 else "s", cap)
+            )
         return None  # dynamic allocation asks again after its backlog timeout (1 s by default)
 
-    want = ("%d more container%s of %s" % (count, "" if count == 1 else "s", mb(size)) if count > 0 and size
-            else "%s more memory" % mb(size))
+    want = (
+        "%d more container%s of %s" % (count, "" if count == 1 else "s", mb(size))
+        if count > 0 and size
+        else "%s more memory" % mb(size)
+    )
     need = size if count > 0 and size else min(size or 0, 1024)  # one container, as far as we know
     head = "It asks YARN for %s and does not get %s yet: " % (want, "them" if count != 1 else "it")
 
     if node_size and need > node_size:
-        return head + ("one container (%s) is bigger than any node gives YARN (%s), so it can never start. "
-                       "Make the executors smaller." % (mb(need), mb(node_size)))
+        return head + (
+            "one container (%s) is bigger than any node gives YARN (%s), so it can never start. "
+            "Make the executors smaller." % (mb(need), mb(node_size))
+        )
     if q is not None and total:
         user = str(app.get("user", ""))
-        user_used = sum(to_float(a.get("allocatedMB")) or 0 for a in apps
-                        if str(a.get("user")) == user and (to_float(a.get("allocatedMB")) or 0) > 0
-                        and find_queue(queues, str(a.get("queue", ""))) is q)
+        user_used = sum(
+            to_float(a.get("allocatedMB")) or 0
+            for a in apps
+            if str(a.get("user")) == user
+            and (to_float(a.get("allocatedMB")) or 0) > 0
+            and find_queue(queues, str(a.get("queue", ""))) is q
+        )
         q_used = to_float(((q.live or {}).get("resourcesUsed") or {}).get("memory")) or 0
-        if q.one_user_max is not None and q.abs_max is not None and q.one_user_max < q.abs_max - 1e-9 \
-                and user_used + need > q.one_user_max * total:
-            return head + ("user %s already uses %s of the cluster with all its apps, and one user may use only "
-                           "%s in queue %s (user-limit-factor %g x guaranteed %s). Every app of this user shares "
-                           "that limit. Raise user-limit-factor for the queue, or submit as several users."
-                           % (user, pct(user_used / total), pct(q.one_user_max), q.path, q.ulf, pct(q.abs_cap)))
+        if (
+            q.one_user_max is not None
+            and q.abs_max is not None
+            and q.one_user_max < q.abs_max - 1e-9
+            and user_used + need > q.one_user_max * total
+        ):
+            return head + (
+                "user %s already uses %s of the cluster with all its apps, and one user may use only "
+                "%s in queue %s (user-limit-factor %g x guaranteed %s). Every app of this user shares "
+                "that limit. Raise user-limit-factor for the queue, or submit as several users."
+                % (user, pct(user_used / total), pct(q.one_user_max), q.path, q.ulf, pct(q.abs_cap))
+            )
         # A maximum of the whole cluster is no queue limit: then the cluster itself is full (below)
         if q.abs_max is not None and q.abs_max < 0.999 and q_used + need > q.abs_max * total:
-            return head + ("queue %s is at its maximum (%s of the cluster, maximum-capacity). It gets more only "
-                           "when its own apps free containers." % (q.path, pct(q.abs_max)))
+            return head + (
+                "queue %s is at its maximum (%s of the cluster, maximum-capacity). It gets more only "
+                "when its own apps free containers." % (q.path, pct(q.abs_max))
+            )
     if node_free >= need:
-        older = [a for a in apps if a is not app and a.get("state") == "RUNNING" and pending_request(a)[0]
-                 and str(a.get("queue")) == str(app.get("queue"))
-                 and (a.get("startedTime") or 0, a.get("id", "")) < (app.get("startedTime") or 0, app.get("id", ""))]
+        older = [
+            a
+            for a in apps
+            if a is not app
+            and a.get("state") == "RUNNING"
+            and pending_request(a)[0]
+            and str(a.get("queue")) == str(app.get("queue"))
+            and (a.get("startedTime") or 0, a.get("id", "")) < (app.get("startedTime") or 0, app.get("id", ""))
+        ]
         fair = q is not None and "fair" in (q.ordering or "").lower()
         if older and not fair:
-            return head + ("older apps in the same queue ask for containers too (%s), and YARN serves the apps of a "
-                           "queue in start order (FIFO, the default ordering-policy). This app gets containers "
-                           "after them. Setting the queue's ordering-policy to fair shares the queue between "
-                           "its apps." % ", ".join(str(a.get("id")) for a in older[:3]))
+            return head + (
+                "older apps in the same queue ask for containers too (%s), and YARN serves the apps of a "
+                "queue in start order (FIFO, the default ordering-policy). This app gets containers "
+                "after them. Setting the queue's ordering-policy to fair shares the queue between "
+                "its apps." % ", ".join(str(a.get("id")) for a in older[:3])
+            )
         if older and fair:
-            return head + ("other apps in the same queue ask for containers too (%s). The queue shares between its "
-                           "apps (ordering-policy fair), so this app gets its turn as containers end."
-                           % ", ".join(str(a.get("id")) for a in older[:3]))
-        return head + ("a node has %s free, so YARN should give them within seconds. If this stays, check "
-                       "node labels and data-locality waits (yarn.scheduler.capacity.node-locality-delay)."
-                       % mb(node_free))
+            return head + (
+                "other apps in the same queue ask for containers too (%s). The queue shares between its "
+                "apps (ordering-policy fair), so this app gets its turn as containers end."
+                % ", ".join(str(a.get("id")) for a in older[:3])
+            )
+        return head + (
+            "a node has %s free, so YARN should give them within seconds. If this stays, check "
+            "node labels and data-locality waits (yarn.scheduler.capacity.node-locality-delay)." % mb(node_free)
+        )
     if free_total >= need:
-        return head + ("the cluster has %s free in total, but no single node has %s free (the most is %s), "
-                       "and one container must fit on one node." % (mb(free_total), mb(need), mb(node_free)))
+        return head + (
+            "the cluster has %s free in total, but no single node has %s free (the most is %s), "
+            "and one container must fit on one node." % (mb(free_total), mb(need), mb(node_free))
+        )
     above = ""
     if q is not None and q.abs_cap is not None and total:
         q_used = to_float(((q.live or {}).get("resourcesUsed") or {}).get("memory")) or 0
-        above = (" Queue %s already uses %s, more than its guaranteed %s, so it only gets what other queues "
-                 "free." % (q.path, pct(q_used / total), pct(q.abs_cap)) if q_used > q.abs_cap * total else
-                 " Queue %s uses %s, less than its guaranteed %s, so YARN gives it memory first as other "
-                 "containers end (or by preemption, if it is on)." % (q.path, pct(q_used / total), pct(q.abs_cap)))
-    return head + ("the cluster is full: only %s is free and the most on one node is %s.%s"
-                   % (mb(free_total), mb(node_free), above))
+        above = (
+            " Queue %s already uses %s, more than its guaranteed %s, so it only gets what other queues "
+            "free." % (q.path, pct(q_used / total), pct(q.abs_cap))
+            if q_used > q.abs_cap * total
+            else " Queue %s uses %s, less than its guaranteed %s, so YARN gives it memory first as other "
+            "containers end (or by preemption, if it is on)." % (q.path, pct(q_used / total), pct(q.abs_cap))
+        )
+    return head + (
+        "the cluster is full: only %s is free and the most on one node is %s.%s"
+        % (mb(free_total), mb(node_free), above)
+    )
 
 
-def app_users(live, queues):
+def app_users(live: Optional[Live], queues: Dict[str, Queue]) -> List[Tuple[Tuple[str, str], List[Json]]]:
     """Group the apps by queue and user: [(queue path, user, apps)] with the busiest group first."""
-    groups = {}
+    groups: Dict[Tuple[str, str], List[Json]] = {}
     for a in (live or {}).get("apps") or []:
         qname = str(a.get("queue", "?"))
         q = find_queue(queues, qname) if queues else None
@@ -2032,25 +2749,36 @@ def app_users(live, queues):
     return sorted(groups.items(), key=lambda kv: -sum(to_float(a.get("allocatedMB")) or 0 for a in kv[1]))
 
 
-def print_apps(live, queues):
+def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
     apps = live.get("apps")
     if apps is None:
         return
     total = to_float(live["metrics"].get("totalMB")) or 0
-    section("Apps", "The apps that run or wait in YARN now, grouped by queue and user. YARN counts the "
-                    "user limit per user, not per app: all apps of one account (for example a service "
-                    "account) share one user limit.")
+    section(
+        "Apps",
+        "The apps that run or wait in YARN now, grouped by queue and user. YARN counts the "
+        "user limit per user, not per app: all apps of one account (for example a service "
+        "account) share one user limit.",
+    )
     listed = len(apps)
     reported = (live["metrics"].get("appsRunning") or 0) + (live["metrics"].get("appsPending") or 0)
     if reported > listed:
-        print(paint(wrap("The ResourceManager reports %d running or waiting apps but shows only %d to this "
-                         "user. YARN ACLs (yarn.acl.enable) hide the others. Run the script as a YARN admin "
-                         "(yarn.admin.acl) to see all apps." % (reported, listed), "  "), "bad"))
+        print(
+            paint(
+                wrap(
+                    "The ResourceManager reports %d running or waiting apps but shows only %d to this "
+                    "user. YARN ACLs (yarn.acl.enable) hide the others. Run the script as a YARN admin "
+                    "(yarn.admin.acl) to see all apps." % (reported, listed),
+                    "  ",
+                ),
+                "bad",
+            )
+        )
         print()
     if not apps:
         print("  No apps run or wait now.")
         return
-    waiting_notes = []
+    waiting_notes: List[Tuple[str, str]] = []
     for (qpath, user), group in app_users(live, queues):
         q = queues.get(qpath) if queues else None
         running = [a for a in group if a.get("state") == "RUNNING"]
@@ -2071,11 +2799,16 @@ def print_apps(live, queues):
             am_lim = (lq.get("userAMResourceLimit") or {}).get("memory")
             if am_used is not None and am_lim:
                 line += " %s AM %s of %s" % (DOT, mb(am_used), mb(am_lim))
-        at_limit = (q is not None and q.one_user_max and total and used / total >= q.one_user_max * 0.95)
-        print(highlight(wrap(line, "  ", "    ")) if not at_limit else
-              highlight(wrap(line + " %s AT ITS USER LIMIT" % DOT, "  ", "    ")).replace(
-                  "AT ITS USER LIMIT", paint("AT ITS USER LIMIT", "PROBLEM")))
-        def count(value):  # YARN sends -1 when an app has no containers yet
+        at_limit = q is not None and q.one_user_max and total and used / total >= q.one_user_max * 0.95
+        print(
+            highlight(wrap(line, "  ", "    "))
+            if not at_limit
+            else highlight(wrap(line + " %s AT ITS USER LIMIT" % DOT, "  ", "    ")).replace(
+                "AT ITS USER LIMIT", paint("AT ITS USER LIMIT", "PROBLEM")
+            )
+        )
+
+        def count(value: Any) -> str:  # YARN sends -1 when an app has no containers yet
             n = to_float(value)
             return str(int(n)) if n is not None and n >= 0 else "-"
 
@@ -2083,15 +2816,35 @@ def print_apps(live, queues):
         for a in sorted(group, key=lambda x: (x.get("state") != "RUNNING", -(to_float(x.get("allocatedMB")) or 0))):
             name = str(a.get("name", "?"))
             alloc = to_float(a.get("allocatedMB"))
-            rows.append([a.get("id", "?"), name if len(name) <= 28 else name[:27] + "~", a.get("state", "?"),
-                         elapsed(a.get("elapsedTime")), count(a.get("runningContainers")),
-                         mb(alloc) if alloc is not None and alloc >= 0 else "-",
-                         count(a.get("allocatedVCores")), doing_now(a)])
+            rows.append(
+                [
+                    a.get("id", "?"),
+                    name if len(name) <= 28 else name[:27] + "~",
+                    a.get("state", "?"),
+                    elapsed(a.get("elapsedTime")),
+                    count(a.get("runningContainers")),
+                    mb(alloc) if alloc is not None and alloc >= 0 else "-",
+                    count(a.get("allocatedVCores")),
+                    doing_now(a),
+                ]
+            )
             if a.get("state") == "ACCEPTED":
                 waiting_notes.append((a.get("id", "?"), wait_reason(a)[1]))
-        table(["App", "Name", "State", "Time", "Cont", "Memory", "vcores", "Doing now"], rows, indent="    ",
-              roles=["label", None, lambda c: "good" if c == "RUNNING" else "bad", None, None, "value", None,
-                     lambda c: "bad" if (c.startswith("waiting") or " %s wants " % DOT in c) else None])
+        table(
+            ["App", "Name", "State", "Time", "Cont", "Memory", "vcores", "Doing now"],
+            rows,
+            indent="    ",
+            roles=[
+                "label",
+                None,
+                lambda c: "good" if c == "RUNNING" else "bad",
+                None,
+                None,
+                "value",
+                None,
+                lambda c: "bad" if (c.startswith("waiting") or " %s wants " % DOT in c) else None,
+            ],
+        )
         print()
     starved = [(a, why_no_resources(a, live, queues)) for a in apps if a.get("state") == "RUNNING"]
     starved = [(a, why) for a, why in starved if why]
@@ -2107,12 +2860,19 @@ def print_apps(live, queues):
         for app_id, text in waiting_notes:
             print(highlight(wrap("%s: %s" % (app_id, text or "no reason given by YARN"), "  - ", "    ")))
             print()
-    print(highlight(wrap("Doing now: for Spark apps, the active stage and its finished/total tasks, read from "
-                         "the Spark UI through the ResourceManager proxy. When the UI does not answer, YARN's "
-                         "progress is shown instead.", "  ")))
+    print(
+        highlight(
+            wrap(
+                "Doing now: for Spark apps, the active stage and its finished/total tasks, read from "
+                "the Spark UI through the ResourceManager proxy. When the UI does not answer, YARN's "
+                "progress is shown instead.",
+                "  ",
+            )
+        )
+    )
 
 
-def watch(seconds, files, rm, executor, am):
+def watch(seconds: int, files: Dict[str, ConfigFile], rm: Optional[str], executor: Container, am: Container) -> None:
     """Redraw the queues and apps every few seconds, like yarn top. Ctrl-C stops it."""
     clear = sys.stdout.isatty()
     while True:
@@ -2124,40 +2884,79 @@ def watch(seconds, files, rm, executor, am):
         print(paint("YARN queues and apps", "section") + "   %s   every %d s, Ctrl-C stops" % (now, seconds))
         if live:
             m = live["metrics"]
-            print(highlight("ResourceManager %s %s cluster memory %s, free %s %s %s running, %s waiting"
-                            % (live["base"], DOT, mb(m.get("totalMB")), mb(m.get("availableMB")), DOT,
-                               m.get("appsRunning"), m.get("appsPending"))))
+            print(
+                highlight(
+                    "ResourceManager %s %s cluster memory %s, free %s %s %s running, %s waiting"
+                    % (
+                        live["base"],
+                        DOT,
+                        mb(m.get("totalMB")),
+                        mb(m.get("availableMB")),
+                        DOT,
+                        m.get("appsRunning"),
+                        m.get("appsPending"),
+                    )
+                )
+            )
         for e in errors:
             print(paint(wrap(e, "  - ", "    "), "bad"))
         if live:
             if queues:
                 print_queues(queues, queue_groups(files["cs"], live), None, None, am, explain=False)
                 min_alloc = to_float(files["yarn"].get("yarn.scheduler.minimum-allocation-mb", "1024")) or 1024
-                launcher_q = (find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
-                              if files["oozie"].props is not None else None)
-                print_balances(queues, live, None, launcher_q, am, executor, False, full=False,
-                               launcher_size=launcher_size(files, min_alloc))
+                launcher_q = (
+                    find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
+                    if files["oozie"].props is not None
+                    else None
+                )
+                print_balances(
+                    queues,
+                    live,
+                    None,
+                    launcher_q,
+                    am,
+                    executor,
+                    False,
+                    full=False,
+                    launcher_size=launcher_size(files, min_alloc),
+                )
             print_apps(live, queues)
         sys.stdout.flush()
         time.sleep(seconds)
 
 
-def print_nodes(live):
+def print_nodes(live: Live) -> None:
     nodes = live.get("nodes") or []
     m = live["metrics"]
-    section("Nodes", "Cluster memory for YARN: %s, free %s. Apps: %s running, %s waiting."
-            % (mb(m.get("totalMB")), mb(m.get("availableMB")), m.get("appsRunning"), m.get("appsPending")))
+    section(
+        "Nodes",
+        "Cluster memory for YARN: %s, free %s. Apps: %s running, %s waiting."
+        % (mb(m.get("totalMB")), mb(m.get("availableMB")), m.get("appsRunning"), m.get("appsPending")),
+    )
     rows = []
     for n in sorted(nodes, key=lambda n: n.get("availMemoryMB") or 0, reverse=True):
         used, free = n.get("usedMemoryMB") or 0, n.get("availMemoryMB") or 0
         # ip-10-0-0-1.ec2.internal -> ip-10-0-0-1: the short name is unique and keeps the table narrow
-        rows.append([n.get("nodeHostName", "?").split(".")[0], mb(used + free), mb(used), mb(free),
-                     "%s of %s" % (n.get("usedVirtualCores", 0),
-                                   (n.get("usedVirtualCores") or 0) + (n.get("availableVirtualCores") or 0)),
-                     str(n.get("numContainers", 0)), n.get("state", "?")])
-    table(["Node", "YARN memory", "Used", "Free", "vcores used", "Containers", "State"], rows,
-          roles=["label", None, None, "value", None, None,
-                 lambda c: "good" if c == "RUNNING" else "bad"])
+        rows.append(
+            [
+                n.get("nodeHostName", "?").split(".")[0],
+                mb(used + free),
+                mb(used),
+                mb(free),
+                "%s of %s"
+                % (
+                    n.get("usedVirtualCores", 0),
+                    (n.get("usedVirtualCores") or 0) + (n.get("availableVirtualCores") or 0),
+                ),
+                str(n.get("numContainers", 0)),
+                n.get("state", "?"),
+            ]
+        )
+    table(
+        ["Node", "YARN memory", "Used", "Free", "vcores used", "Containers", "State"],
+        rows,
+        roles=["label", None, None, "value", None, None, lambda c: "good" if c == "RUNNING" else "bad"],
+    )
 
 
 # (label, file, property, default, unit) - the settings behind the findings
@@ -2169,8 +2968,7 @@ SETTINGS = [
     ("yarn", "vcores per node for YARN (this host)", "yarn.nodemanager.resource.cpu-vcores", "8", ""),
     ("yarn", "Node labels on", "yarn.node-labels.enabled", "false", ""),
     ("yarn", "Node label for ApplicationMasters", "yarn.node-labels.am.default-node-label-expression", "", ""),
-    ("cs", "Containers are sized by", "yarn.scheduler.capacity.resource-calculator",
-     "memory only", ""),
+    ("cs", "Containers are sized by", "yarn.scheduler.capacity.resource-calculator", "memory only", ""),
     ("cs", "AM pool of each queue (default)", "yarn.scheduler.capacity.maximum-am-resource-percent", "0.1", ""),
     ("cs", "Most apps (running + waiting)", "yarn.scheduler.capacity.maximum-applications", "10000", ""),
     ("cs", "Most running apps", "yarn.scheduler.capacity.max-parallel-apps", "", ""),
@@ -2196,7 +2994,7 @@ SETTINGS = [
 ]
 
 
-def setting_value(cf, name, default, unit):
+def setting_value(cf: ConfigFile, name: str, default: Optional[str], unit: str) -> str:
     """The value of one setting as the report shows it."""
     if cf.has(name):
         value = cf.get(name)
@@ -2227,11 +3025,11 @@ QUEUE_SETTINGS = [
 ]
 
 
-def queue_paths(cs):
+def queue_paths(cs: ConfigFile) -> List[Tuple[str, bool]]:
     """Every queue in capacity-scheduler.xml, parents first: [(path, is_leaf)]."""
-    out = []
+    out: List[Tuple[str, bool]] = []
 
-    def walk(path):
+    def walk(path: str) -> None:
         children = [c.strip() for c in cs.get("yarn.scheduler.capacity.%s.queues" % path, "").split(",") if c.strip()]
         out.append((path, not children))
         for c in children:
@@ -2241,20 +3039,20 @@ def queue_paths(cs):
     return out[1:]  # root itself always has 100%
 
 
-def queue_setting_rows(cs):
+def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, str, str]]]]:
     """Rows (label, property, value) for the settings of each queue, with the default when not set."""
     global_am = cs.get("yarn.scheduler.capacity.maximum-am-resource-percent")
     global_apps = cs.get("yarn.scheduler.capacity.max-parallel-apps")
-    blocks = []
+    blocks: List[Tuple[str, bool, List[Tuple[str, str, str]]]] = []
     for path, leaf in queue_paths(cs):
-        rows = []
+        rows: List[Tuple[str, str, str]] = []
         for label, suffix, default, unit, leaf_only in QUEUE_SETTINGS:
             if leaf_only and not leaf:
                 continue
             name = "yarn.scheduler.capacity.%s.%s" % (path, suffix)
             if cs.has(name):
-                value = cs.get(name)
-                value = value + unit if value and to_float(value) is not None else (value or "(empty)")
+                raw = cs.get(name)
+                value = raw + unit if raw and to_float(raw) is not None else (raw or "(empty)")
             elif suffix == "maximum-am-resource-percent":
                 value = ("%s (cluster-wide value)" % global_am) if global_am else "0.1 (default)"
             elif suffix == "maximum-allocation-mb":
@@ -2270,56 +3068,89 @@ def queue_setting_rows(cs):
     return blocks
 
 
-def print_settings(files):
-    section("Settings", "The settings behind the findings. \"(default)\" means that the file does not "
-                        "have the setting, so YARN, Spark or Oozie uses its default. \"(cluster-wide value)\" "
-                        "means that the queue has no own value and uses the one for all queues.")
-    rows = {key: [(label, name, setting_value(files[key], name, default, unit))
-                  for f, label, name, default, unit in SETTINGS if f == key] for key in files}
+def print_settings(files: Dict[str, ConfigFile]) -> None:
+    section(
+        "Settings",
+        'The settings behind the findings. "(default)" means that the file does not '
+        'have the setting, so YARN, Spark or Oozie uses its default. "(cluster-wide value)" '
+        "means that the queue has no own value and uses the one for all queues.",
+    )
+    rows = {
+        key: [
+            (label, name, setting_value(files[key], name, default, unit))
+            for f, label, name, default, unit in SETTINGS
+            if f == key
+        ]
+        for key in files
+    }
     queue_blocks = queue_setting_rows(files["cs"]) if files["cs"].props is not None else []
     all_rows = [r for rs in rows.values() for r in rs] + [r for _, _, rs in queue_blocks for r in rs]
     w_label = max(len(r[0]) for r in all_rows)
     w_name = max(len(r[1]) for r in all_rows)
 
-    def show(label, name, value):
+    def show(label: str, name: str, value: str) -> None:
         role = "default" if (value.endswith("(default)") or value == "not set") else "value"
-        print("  %s  %s  %s" % ("%-*s" % (w_label, label), paint(name, "prop") + " " * (w_name - len(name)),
-                                paint(value, role)))
+        print(
+            "  %s  %s  %s"
+            % ("%-*s" % (w_label, label), paint(name, "prop") + " " * (w_name - len(name)), paint(value, role))
+        )
 
-    print("  %s  %s  %s" % (paint("%-*s" % (w_label, "Description"), "label"),
-                            paint("%-*s" % (w_name, "Setting"), "label"), paint("Value", "label")))
+    print(
+        "  %s  %s  %s"
+        % (
+            paint("%-*s" % (w_label, "Description"), "label"),
+            paint("%-*s" % (w_name, "Setting"), "label"),
+            paint("Value", "label"),
+        )
+    )
     for key in ("yarn", "cs", "spark", "oozie"):
         cf = files[key]
         print()
         print("  " + paint(cf.path, "file"))
         if cf.props is None:
-            print("    " + paint("not read, see \"Could not read\" above", "bad"))
+            print("    " + paint('not read, see "Could not read" above', "bad"))
             continue
         for label, name, value in rows[key]:
             show(label, name, value)
         if key == "cs":
             for path, leaf, qrows in queue_blocks:
                 print()
-                print("  " + paint("Queue %s" % path, "queue") + ("" if leaf else "  (parent queue: its "
-                                                                   "children share it)"))
+                print(
+                    "  "
+                    + paint("Queue %s" % path, "queue")
+                    + ("" if leaf else "  (parent queue: its children share it)")
+                )
                 for label, name, value in qrows:
                     show(label, name, value)
 
 
-def print_header(emr, files, live, live_errors, live_wanted):
+def print_header(
+    emr: Optional[Json], files: Dict[str, ConfigFile], live: Optional[Live], live_errors: List[str], live_wanted: bool
+) -> None:
     title = "YARN and Spark resource report"
     print(paint(title, "section"))
     print(paint("=" * len(title), "rule"))
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows = [("Created", now)]
     if emr:
-        rows.append(("Cluster", "%s, %s (%s)" % (emr["id"], emr["release"] or "release unknown",
-                                                 emr["groups"] or "instance groups unknown")))
+        rows.append(
+            (
+                "Cluster",
+                "%s, %s (%s)"
+                % (emr["id"], emr["release"] or "release unknown", emr["groups"] or "instance groups unknown"),
+            )
+        )
         if emr["is_primary"] is None:
             rows.append(("This host", "unknown (EMR node)"))
         else:
-            rows.append(("This host", "primary node" if emr["is_primary"] else
-                         "not the primary node: run the script on the primary node for the right config files"))
+            rows.append(
+                (
+                    "This host",
+                    "primary node"
+                    if emr["is_primary"]
+                    else "not the primary node: run the script on the primary node for the right config files",
+                )
+            )
     if live:
         rows.append(("Live data", "from the ResourceManager at %s" % live["base"]))
     elif live_wanted:
@@ -2341,44 +3172,79 @@ def print_header(emr, files, live, live_errors, live_wanted):
         bullet = paint("  - ", "error")
         items = []
         for cf in errors:
-            items.append(bullet + highlight(wrap(cf.error, "    ", "    "))[4:] + "\n" +
-                         highlight(wrap("Set the directory with: %s" % cf.option, "    ")))
+            items.append(
+                bullet
+                + highlight(wrap(cf.error or "", "    ", "    "))[4:]
+                + "\n"
+                + highlight(wrap("Set the directory with: %s" % cf.option, "    "))
+            )
         if emr_error:
             items.append(bullet + highlight(wrap(emr_error, "    ", "    "))[4:])
         for e in live_errors:
             items.append(bullet + highlight(wrap(e, "    ", "    "))[4:])
         print("\n\n".join(items))
         if live_errors and not live:
-            print(highlight(wrap("Give another address with --rm http://<host>:8088, or use --no-live to skip "
-                                 "the live data.", "    ")))
+            print(
+                highlight(
+                    wrap(
+                        "Give another address with --rm http://<host>:8088, or use --no-live to skip the live data.",
+                        "    ",
+                    )
+                )
+            )
 
 
 # ================================================================== main
 
-def main():
+
+def main() -> None:
     if sys.version_info < (3, 6):
         sys.exit("This script needs Python 3.6 or later (found %s)." % sys.version.split()[0])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--hadoop-conf", default=first_dir(os.environ.get("HADOOP_CONF_DIR"),
-                                                       os.environ.get("YARN_CONF_DIR"), "/etc/hadoop/conf"),
-                    help="directory with yarn-site.xml and capacity-scheduler.xml")
-    ap.add_argument("--spark-conf", default=first_dir(os.environ.get("SPARK_CONF_DIR"), "/etc/spark/conf"),
-                    help="directory with spark-defaults.conf")
-    ap.add_argument("--oozie-conf", default=first_dir(os.environ.get("OOZIE_CONF_DIR"), "/etc/oozie/conf"),
-                    help="directory with oozie-site.xml")
-    ap.add_argument("--live", dest="live", action="store_true", default=None,
-                    help="read live usage from the ResourceManager REST API (default on EMR)")
+    ap.add_argument(
+        "--hadoop-conf",
+        default=first_dir(os.environ.get("HADOOP_CONF_DIR"), os.environ.get("YARN_CONF_DIR"), "/etc/hadoop/conf"),
+        help="directory with yarn-site.xml and capacity-scheduler.xml",
+    )
+    ap.add_argument(
+        "--spark-conf",
+        default=first_dir(os.environ.get("SPARK_CONF_DIR"), "/etc/spark/conf"),
+        help="directory with spark-defaults.conf",
+    )
+    ap.add_argument(
+        "--oozie-conf",
+        default=first_dir(os.environ.get("OOZIE_CONF_DIR"), "/etc/oozie/conf"),
+        help="directory with oozie-site.xml",
+    )
+    ap.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        default=None,
+        help="read live usage from the ResourceManager REST API (default on EMR)",
+    )
     ap.add_argument("--no-live", dest="live", action="store_false", help="do not contact the ResourceManager")
     ap.add_argument("--rm", help="ResourceManager web address, for example http://ip-10-0-0-1:8088")
     ap.add_argument("--all", action="store_true", help="also list every other property in the files")
-    ap.add_argument("--color", choices=("auto", "always", "never"), default="auto",
-                    help="colour the report: auto (only on a terminal, the default), always or never. "
-                         "NO_COLOR turns it off")
-    ap.add_argument("--queue", action="append", metavar="NAME",
-                    help="show the balance sheet of this queue (more than once for more queues). Default: "
-                         "Spark's queue, the Oozie launcher queue and queues with apps")
-    ap.add_argument("--watch", type=int, metavar="SECONDS",
-                    help="show only the queues and apps, redrawn every SECONDS (like yarn top). Needs live data")
+    ap.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="colour the report: auto (only on a terminal, the default), always or never. NO_COLOR turns it off",
+    )
+    ap.add_argument(
+        "--queue",
+        action="append",
+        metavar="NAME",
+        help="show the balance sheet of this queue (more than once for more queues). Default: "
+        "Spark's queue, the Oozie launcher queue and queues with apps",
+    )
+    ap.add_argument(
+        "--watch",
+        type=int,
+        metavar="SECONDS",
+        help="show only the queues and apps, redrawn every SECONDS (like yarn top). Needs live data",
+    )
     args = ap.parse_args()
     use_color(args.color)
     if args.watch is not None and args.watch < 2:
@@ -2406,7 +3272,7 @@ def main():
 
     emr = read_emr_info()
     live_wanted = (emr is not None) if args.live is None else args.live
-    live, live_errors = (fetch_live(rm_urls(files["yarn"], args.rm)) if live_wanted else (None, []))
+    live, live_errors = fetch_live(rm_urls(files["yarn"], args.rm)) if live_wanted else (None, [])
 
     queues = build_queues(files["cs"], live)
     min_alloc = to_float(files["yarn"].get("yarn.scheduler.minimum-allocation-mb", "1024")) or 1024
@@ -2417,15 +3283,29 @@ def main():
     print_findings(findings)
     print_containers(executor, am, deploy, files["spark"])
     if queues:
-        print_queues(queues, queue_groups(files["cs"], live), find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
-                     find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
-                     if files["oozie"].props is not None else None, am)
+        print_queues(
+            queues,
+            queue_groups(files["cs"], live),
+            find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
+            find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
+            if files["oozie"].props is not None
+            else None,
+            am,
+        )
     if live and queues:
-        print_balances(queues, live, find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
-                       find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
-                       if files["oozie"].props is not None else None, am, executor,
-                       "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower(),
-                       only=args.queue, launcher_size=launcher_size(files, min_alloc))
+        print_balances(
+            queues,
+            live,
+            find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
+            find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
+            if files["oozie"].props is not None
+            else None,
+            am,
+            executor,
+            "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower(),
+            only=args.queue,
+            launcher_size=launcher_size(files, min_alloc),
+        )
     if live:
         print_apps(live, queues)
         print_nodes(live)

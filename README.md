@@ -598,6 +598,21 @@ TERMS
                           action (for example the Spark job) ends.
 ```
 
+## Checks (for changes to the script)
+
+The script has type hints and is checked with ruff and mypy (settings in `pyproject.toml`). It
+must keep running on Python 3.6, so the hints use the `typing` module (`List[str]`, not `list[str]`).
+
+```bash
+pip install ruff mypy vermin
+ruff check scripts/yarn_spark_settings.py
+ruff format scripts/yarn_spark_settings.py
+mypy                                   # strict
+vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
+```
+
+The `yarn-spark-settings` workflow runs the same checks on every pull request that changes the script.
+
 ## Error messages
 
 Problems are listed under **COULD NOT READ** at the top of the report. The report still runs and

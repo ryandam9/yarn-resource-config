@@ -1,0 +1,39 @@
+name: yarn-spark-settings
+
+# Lint, format and type checks for scripts/yarn_spark_settings.py (settings in pyproject.toml).
+on:
+  push:
+    branches: [master]
+    paths:
+      - "scripts/yarn_spark_settings.py"
+      - "pyproject.toml"
+      - ".github/workflows/yarn-spark-settings.yml"
+  pull_request:
+    paths:
+      - "scripts/yarn_spark_settings.py"
+      - "pyproject.toml"
+      - ".github/workflows/yarn-spark-settings.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.17.0 mypy==2.4.0 vermin==1.8.0
+      - name: ruff check
+        run: ruff check scripts/yarn_spark_settings.py
+      - name: ruff format
+        run: ruff format --check scripts/yarn_spark_settings.py
+      - name: mypy (strict)
+        run: mypy
+      - name: still runs on Python 3.6
+        run: vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
+      - name: the report runs
+        run: python scripts/yarn_spark_settings.py --no-live --color never > /dev/null
