@@ -1096,6 +1096,23 @@ def find_problems(
                 "AM limit of the queue: %s (maximum-am-resource-percent %s): room for %d %ss."
                 % (gb(pool), pct(q.am_pct), in_queue, kind),
             ]
+            held: Dict[str, List[float]] = {}  # running Oozie launchers in the queue, per account: [count, MB]
+            for app in (live or {}).get("apps") or []:
+                in_q = find_queue({q.path: q}, str(app.get("queue", ""))) is q
+                if in_q and app.get("state") == "RUNNING" and is_launcher(app):
+                    h = held.setdefault(str(app.get("user", "?")), [0, 0.0])
+                    h[0] += 1
+                    h[1] += max(0, to_float(app.get("allocatedMB")) or 0)
+            if held:
+                facts.append(
+                    "Oozie launchers running now: %d, holding %s of AM limit while they wait for their Spark jobs "
+                    "(%s)."
+                    % (
+                        sum(int(h[0]) for h in held.values()),
+                        gb(sum(h[1] for h in held.values())),
+                        ", ".join("%s %d, %s" % (n, int(h[0]), gb(h[1])) for n, h in sorted(held.items())),
+                    )
+                )
             if user_lim:
                 accounts = queue_accounts(q, live)
                 facts.append(
@@ -1358,13 +1375,17 @@ def print_findings(findings: List[Finding]) -> None:
         print()
 
 
-def print_containers(executor: Container, am: Container, deploy: str, spark: ConfigFile) -> None:
+def print_containers(
+    executor: Container, am: Container, deploy: str, spark: ConfigFile, oozie: ConfigFile, l_size: Optional[int]
+) -> None:
     section(
-        "What one Spark app asks YARN for",
-        "From spark-defaults.conf (deploy mode: %s). Options given to spark-submit (--conf, "
-        "--executor-memory, ...) change these for one app." % deploy,
+        "What one Spark job asks YARN for",
+        "From spark-defaults.conf (deploy mode: %s)%s. Options given to spark-submit (--conf, "
+        "--executor-memory, ...) change these for one app." % (deploy, " and oozie-site.xml" if l_size else ""),
     )
     rows = []
+    if l_size:  # an Oozie job starts with its launcher, one container that is an AM of its own
+        rows.append(["Oozie launcher", "-", "-", "-", gb(l_size), oozie.get("oozie.launcher.default.vcores", "1")])
     for c in (executor, am):
         rows.append([c.name, gb(c.heap), gb(c.overhead), gb(c.other) if c.other else "-", gb(c.size), str(c.vcores)])
     table(
@@ -1395,6 +1416,23 @@ def print_containers(executor: Container, am: Container, deploy: str, spark: Con
     else:
         count = "%s (spark.executor.instances)" % spark.get("spark.executor.instances", "2")
     print(highlight(wrap("Number of executors per app: %s." % count, "  ")))
+    if l_size:
+        print()
+        bullets(
+            [
+                "Oozie launcher: oozie.launcher.default.memory.mb %s MB, rounded up to %s; it runs in queue %s "
+                "(oozie.launcher.default.queue) and stays until its Spark job ends."
+                % (
+                    oozie.get("oozie.launcher.default.memory.mb", "2048"),
+                    gb(l_size),
+                    oozie.get("oozie.launcher.default.queue", "default"),
+                ),
+                "The launcher is an ApplicationMaster too, so it counts against the same AM limits as the Spark AM.",
+                "One Spark job from Oozie, before any executor: launcher %s + Spark AM %s = %s."
+                % (gb(l_size), gb(am.size), gb(l_size + am.size)),
+            ],
+            "  ",
+        )
 
 
 QUEUE_COLUMNS = [
@@ -1797,12 +1835,18 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
     # from the user's apps in this queue, for Hadoop versions without per-user numbers
     by_app: Dict[str, float] = {}
     counts: Dict[str, List[int]] = {}
+    # the Oozie launchers that run in the queue now, per service account: [count, MB]; each is one AM
+    b["launchers"] = {}
     for a in live.get("apps") or []:
         if find_queue({q.path: q}, str(a.get("queue", ""))) is q:
             user = str(a.get("user", "?"))
             by_app[user] = by_app.get(user, 0) + max(0, to_float(a.get("allocatedMB")) or 0)
             c = counts.setdefault(user, [0, 0])
             c[0 if a.get("state") == "RUNNING" else 1] += 1
+            if a.get("state") == "RUNNING" and is_launcher(a):
+                n = b["launchers"].setdefault(user, [0, 0.0])
+                n[0] += 1
+                n[1] += max(0, to_float(a.get("allocatedMB")) or 0)
     for u in queue_users(lq):
         name = str(u.get("username", "?"))
         used = res(u.get("resourcesUsed"))
@@ -3044,8 +3088,8 @@ def print_queue_card(
                 (
                     None,
                     "Used",
-                    "the AMs of %s's %d running app%s (launchers and Spark AMs)"
-                    % (name, jobs_now, "" if jobs_now == 1 else "s")
+                    "the AMs of %s's %d running app%s: %s"
+                    % (name, jobs_now, "" if jobs_now == 1 else "s", am_mix(b, name, jobs_now))
                     if jobs_now
                     else "%s has no running apps" % name,
                     gb(user["am_used"]),
@@ -3077,6 +3121,13 @@ def print_queue_card(
             else "full for a new %s" % ("Oozie job" if l_here else "AM"),
         )
         holders = ", ".join("%s %s" % (u["name"], gb(u["am_used"])) for u in b["users"] if u["am_used"])
+        l_n = sum(int(v[0]) for v in b.get("launchers", {}).values())
+        if l_n:
+            holders += "; %d Oozie launcher%s %s" % (
+                l_n,
+                "" if l_n == 1 else "s",
+                gb(sum(v[1] for v in b["launchers"].values())),
+            )
         n_apps = (q.live or {}).get("numActiveApplications", "?")
         rows = [
             (None, "AM percent", "maximum-am-resource-percent", pct(b["am_pct"])),
@@ -3351,13 +3402,32 @@ def elapsed(ms: Any) -> str:
     return "%dm%02ds" % (sec // 60, sec % 60)
 
 
+def am_mix(b: Balance, name: str, apps: int) -> str:
+    """What the running AMs of one service account are: how many Oozie launchers and Spark AMs."""
+    n, mb = b.get("launchers", {}).get(name, [0, 0.0])
+    if not n:
+        return "Spark AMs"
+    return "%d Oozie launcher%s (%s)%s" % (
+        n,
+        "" if n == 1 else "s",
+        gb(mb),
+        " + %d Spark AM%s" % (apps - n, "" if apps - n == 1 else "s") if apps > n else "",
+    )
+
+
+def is_launcher(app: Json) -> bool:
+    """An Oozie launcher: one container, an AM of its own, that waits for the job it started."""
+    return (
+        str(app.get("name", "")).startswith("oozie:launcher") or "oozie" in str(app.get("applicationType", "")).lower()
+    )
+
+
 def doing_now(app: Json) -> str:
     """What one app does now, in a few words."""
     if app.get("state") == "ACCEPTED":
         return "waiting: " + wait_reason(app)[0]
-    name = str(app.get("name", ""))
     stages = app.get("_stages")
-    if name.startswith("oozie:launcher"):
+    if is_launcher(app):
         text = "Oozie launcher: waits for its child job"
     elif stages:
         st = sorted(stages, key=lambda x: x.get("stageId", 0))[0]
@@ -3615,6 +3685,17 @@ def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
             am_lim = (lq.get("userAMResourceLimit") or {}).get("memory")
             if am_used is not None and am_lim:
                 line += " %s AM %s of %s" % (DOT, gb(am_used), gb(am_lim))
+        launchers = [a for a in running if is_launcher(a)]
+        if launchers:
+            one = len(launchers) == 1
+            line += " %s %d Oozie launcher%s hold%s %s (%s)" % (
+                DOT,
+                len(launchers),
+                "" if one else "s",
+                "s" if one else "",
+                gb(sum(max(0, to_float(a.get("allocatedMB")) or 0) for a in launchers)),
+                "an AM that waits for its Spark job" if one else "AMs that wait for their Spark jobs",
+            )
         at_limit = q is not None and q.one_user_max and total and used / total >= q.one_user_max * 0.95
         print(
             highlight(wrap(line, "  ", "    "))
@@ -4129,7 +4210,7 @@ def main() -> None:
         print_queue_cards(card_queues, queues, live, am, executor, files, launcher_size(files, min_alloc))
     if live:
         print_apps(live, queues)
-    print_containers(executor, am, deploy, files["spark"])
+    print_containers(executor, am, deploy, files["spark"], files["oozie"], launcher_size(files, min_alloc))
     if queues:
         print_queues(
             queues,
