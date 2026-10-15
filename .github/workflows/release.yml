@@ -1,10 +1,17 @@
 name: release
 
-# Push a tag such as v1.0.0 to publish a release with yarn_spark_settings.py attached, so that
+# Publish a release with yarn_spark_settings.py attached, so that
 # .../releases/latest/download/yarn_spark_settings.py always gives the newest released version.
+# Either push a tag such as v1.0.0, or run this workflow from the Actions tab with the version:
+# then it creates the tag on the commit it runs on.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example v1.0.0"
+        required: true
 
 permissions:
   contents: write
@@ -15,9 +22,15 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: the version
+        env:
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Version must look like v1.0.0, got: $VERSION"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: the script runs
         run: python3 yarn_spark_settings.py --no-live --color never > /dev/null
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" yarn_spark_settings.py --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$VERSION" yarn_spark_settings.py --target "$GITHUB_SHA" --title "$VERSION" --generate-notes
