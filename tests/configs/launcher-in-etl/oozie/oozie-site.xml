@@ -1,0 +1,3 @@
+<?xml version="1.0"?><configuration>
+<property><name>oozie.launcher.default.queue</name><value>etl</value></property>
+</configuration>

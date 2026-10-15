@@ -1,0 +1,8 @@
+<?xml version="1.0"?><configuration>
+<property><name>yarn.resourcemanager.hostname</name><value>127.0.0.1</value></property>
+<property><name>yarn.resourcemanager.webapp.address</name><value>127.0.0.1:18088</value></property>
+<property><name>yarn.scheduler.maximum-allocation-mb</name><value>12288</value></property>
+<property><name>yarn.scheduler.minimum-allocation-mb</name><value>32</value></property>
+<property><name>yarn.nodemanager.resource.memory-mb</name><value>12288</value></property>
+<property><name>yarn.nodemanager.resource.cpu-vcores</name><value>4</value></property>
+</configuration>

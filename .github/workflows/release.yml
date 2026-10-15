@@ -1,0 +1,23 @@
+name: release
+
+# Push a tag such as v1.0.0 to publish a release with yarn_spark_settings.py attached, so that
+# .../releases/latest/download/yarn_spark_settings.py always gives the newest released version.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: the script runs
+        run: python3 yarn_spark_settings.py --no-live --color never > /dev/null
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" yarn_spark_settings.py --title "$GITHUB_REF_NAME" --generate-notes
