@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import fake_rm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "yarn_spark_settings.py")
+SCRIPT = os.path.join(os.path.dirname(HERE), "yarn_resource_config.py")
 CONFIGS = sorted(os.listdir(os.path.join(HERE, "configs")))
 FLAGS = [[], ["--details"], ["--queue", "default"], ["--all", "--color", "always"]]
 

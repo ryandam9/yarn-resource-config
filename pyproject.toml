@@ -1,11 +1,11 @@
-# Tool settings for yarn_spark_settings.py and its tests.
+# Tool settings for yarn_resource_config.py and its tests.
 # The script runs on Python 3.6+ (old EMR images): the type hints use the typing module, and
-# `vermin --target=3.6- yarn_spark_settings.py tests` checks that nothing newer is used.
+# `vermin --target=3.6- yarn_resource_config.py tests` checks that nothing newer is used.
 
 [tool.ruff]
 line-length = 120
 target-version = "py37"  # the oldest version ruff knows; the script itself also runs on 3.6
-include = ["yarn_spark_settings.py", "tests/*.py"]
+include = ["yarn_resource_config.py", "tests/*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "I", "UP", "SIM", "ANN"]  # ANN: every function has type hints
@@ -21,4 +21,4 @@ python-version = "3.7"  # the oldest version ty knows; vermin covers 3.6
 extra-paths = ["tests"]  # the tests import fake_rm from there
 
 [tool.ty.src]
-include = ["yarn_spark_settings.py", "tests"]
+include = ["yarn_resource_config.py", "tests"]

@@ -1,4 +1,4 @@
-# yarn_spark_settings.py
+# yarn_resource_config.py
 
 Reports, in plain words, why a Spark app on YARN may get no resources: containers too big for
 YARN or for the nodes, a full ApplicationMaster pool, Oozie launchers that block Spark jobs, user
@@ -11,7 +11,7 @@ plus its Spark ApplicationMaster) can start now, with the limits worked out as p
 value. Then come the apps, what one Spark app asks for, the queues, the nodes and the settings
 behind the findings, and a short list of the terms used.
 
-It is one file, `yarn_spark_settings.py`, with no dependencies.
+It is one file, `yarn_resource_config.py`, with no dependencies. (Up to v1.0.0 it was called `yarn_spark_settings.py`.)
 
 Background: [Why your Spark app gets no YARN resources](https://github.com/ryandam9/Guides-2/blob/master/docs/yarn_resources_explained_by_claude.html).
 
@@ -42,8 +42,8 @@ Background: [Why your Spark app gets no YARN resources](https://github.com/ryand
 From a release (a fixed version), or from `main`:
 
 ```bash
-curl -fsSLO https://github.com/ryandam9/yarn-resource-config/releases/latest/download/yarn_spark_settings.py
-curl -fsSLO https://raw.githubusercontent.com/ryandam9/yarn-resource-config/main/yarn_spark_settings.py
+curl -fsSLO https://github.com/ryandam9/yarn-resource-config/releases/latest/download/yarn_resource_config.py
+curl -fsSLO https://raw.githubusercontent.com/ryandam9/yarn-resource-config/main/yarn_resource_config.py
 ```
 
 When the cluster cannot reach GitHub, copy the file to S3 from your machine and take it from there
@@ -59,7 +59,7 @@ Everything works without options. The script finds the config files, sees that i
 Connect with SSH or Session Manager, copy the script, then:
 
 ```bash
-python3 yarn_spark_settings.py
+python3 yarn_resource_config.py
 ```
 
 ### As an EMR step (no SSH needed)
@@ -68,9 +68,9 @@ Upload the script to S3 and add a step. The step streams the script into `python
 is written on the node:
 
 ```bash
-aws s3 cp yarn_spark_settings.py s3://<bucket>/tools/
+aws s3 cp yarn_resource_config.py s3://<bucket>/tools/
 aws emr add-steps --cluster-id j-XXXXXXXX --steps \
-  'Type=CUSTOM_JAR,Name=yarn-settings,ActionOnFailure=CONTINUE,Jar=command-runner.jar,Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_spark_settings.py - | python3 -"]'
+  'Type=CUSTOM_JAR,Name=yarn-resource-config,ActionOnFailure=CONTINUE,Jar=command-runner.jar,Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_resource_config.py - | python3 -"]'
 ```
 
 Add options after `python3 -`, for example `python3 - --all`.
@@ -108,7 +108,7 @@ ResourceManager. Things to know:
   node. The live node list shows the real node sizes.
 
 ```bash
-python3 yarn_spark_settings.py --live --rm http://<primary-node-private-dns>:8088
+python3 yarn_resource_config.py --live --rm http://<primary-node-private-dns>:8088
 ```
 
 ### Other Hadoop clusters
@@ -117,7 +117,7 @@ Point the script at the config directories, or set `HADOOP_CONF_DIR` (or `YARN_C
 `SPARK_CONF_DIR` and `OOZIE_CONF_DIR`:
 
 ```bash
-python3 yarn_spark_settings.py --hadoop-conf /opt/hadoop/etc/hadoop \
+python3 yarn_resource_config.py --hadoop-conf /opt/hadoop/etc/hadoop \
     --spark-conf /opt/spark/conf --live --rm http://rm-host:8088
 ```
 
@@ -1040,7 +1040,7 @@ pip install ruff ty vermin
 ruff check .                                 # lint, and every function has type hints (ANN)
 ruff format .
 ty check                                     # type check, against Python 3.7
-vermin --no-tips --violations -t=3.6- yarn_spark_settings.py tests
+vermin --no-tips --violations -t=3.6- yarn_resource_config.py tests
 python -m unittest discover -s tests -v      # the tests (standard library only)
 ```
 
