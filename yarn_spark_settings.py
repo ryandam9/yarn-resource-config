@@ -1801,6 +1801,18 @@ def why_user_limit(b: Balance, user: User, need: float, what: str, same_u: float
     q = b["q"]
     capped = b["ulf"] > 0 and b["ulf"] * b["guar"][0] > b["max"][0]
     name = "A new user" if user["name"] == NEW_USER else user["name"]
+    if b["ulf"] > 0:
+        limit_line = "User limit: user-limit-factor %g x guaranteed %s = %s%s" % (
+            b["ulf"],
+            gb(b["guar"][0]),
+            gb(b["ulf"] * b["guar"][0]),
+            ", cut to the queue max %s" % gb(b["max"][0]) if capped else "",
+        )
+    else:  # -1 (Hadoop 3.3+): no user limit, so one user may use the queue max
+        limit_line = "User limit: user-limit-factor %g means no user limit, so it is the queue max: %s" % (
+            b["ulf"],
+            gb(b["max"][0]),
+        )
     fix = ["Wait until one of this user's apps ends."]
     if b["guar"][0] and b["ulf"] > 0 and not capped:
         fix.append(
@@ -1815,16 +1827,7 @@ def why_user_limit(b: Balance, user: User, need: float, what: str, same_u: float
             "account) share this limit.",
         ],
         "calc": [
-            (
-                None,
-                "User limit: user-limit-factor %g x guaranteed %s = %s%s"
-                % (
-                    b["ulf"],
-                    gb(b["guar"][0]),
-                    gb(b["ulf"] * b["guar"][0]),
-                    ", cut to the queue max %s" % gb(b["max"][0]) if capped else "",
-                ),
-            ),
+            (None, limit_line),
             (None, "%s uses now: %s (all its apps together)" % (name, gb(user["used"] + same_u))),
             (
                 "no",
@@ -2348,16 +2351,23 @@ def print_balance(
 
 def print_checks(checks: List[Check]) -> None:
     for ok, text, _ in checks:
-        print("        " + (paint(MARK_OK, "good") if ok else paint(BOX["no"], "bad")) + " " + highlight(text))
+        print("        " + mark("ok" if ok else "no") + " " + highlight(text))
+
+
+# All marks take the same width, so the text after them lines up. On an ASCII terminal "OK" is two
+# characters while "X" and "*" are one.
+MARK_W = max(len(MARK_OK), len(BOX["no"]), len(BOX["bullet"]))
 
 
 def mark(kind: Optional[str]) -> str:
-    """✓ for ok, ✗ for not enough, a bullet for a plain fact."""
+    """✓ for ok, ✗ for not enough, a bullet for a plain fact; padded to MARK_W."""
     if kind == "ok":
-        return paint(MARK_OK, "good")
-    if kind == "no":
-        return paint(BOX["no"], "bad")
-    return BOX["bullet"]
+        text, role = MARK_OK, "good"
+    elif kind == "no":
+        text, role = BOX["no"], "bad"
+    else:
+        text, role = BOX["bullet"], ""
+    return paint(text, role) + " " * (MARK_W - len(text))
 
 
 def bullets(items: Sequence[Union[str, Tuple[Optional[str], str]]], ind: str, numbered: bool = False) -> None:
@@ -2365,7 +2375,7 @@ def bullets(items: Sequence[Union[str, Tuple[Optional[str], str]]], ind: str, nu
     for i, item in enumerate(items, 1):
         kind, text = item if isinstance(item, tuple) else (None, item)
         head = "%d." % i if numbered else mark(kind)
-        width = len("%d." % i) if numbered else 1
+        width = len("%d." % i) if numbered else MARK_W
         line = wrap(text, ind + "x" * width + " ", ind + " " * (width + 1))
         print(ind + head + highlight(line[len(ind) + width :]))
 
