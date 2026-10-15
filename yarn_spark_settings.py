@@ -13,6 +13,7 @@ Run it on the primary node of an Amazon EMR cluster (or on a Hadoop edge node):
     python3 yarn_spark_settings.py --all        # also list every other property in the files
     python3 yarn_spark_settings.py --color never  # no colour (it is on only on a terminal anyway)
     python3 yarn_spark_settings.py --watch 30   # queues and apps, redrawn every 30 s (like yarn top)
+    python3 yarn_spark_settings.py --queue etl  # first a one-screen answer: can a job run in queue etl?
 
 The script needs Python 3.6 or later (EMR 6 and 7 have it) and uses only the standard library.
 
@@ -351,21 +352,53 @@ def section(title: str, note: str = "") -> None:
 def _box_chars() -> Tuple[Dict[str, str], str, str]:
     """Frame characters and the separator dot: box drawing when the terminal can show them, else plain ASCII."""
     try:
-        "┌─│└✓✗−◀·•".encode(sys.stdout.encoding or "ascii")
+        "┌─│└✓✗−◀·•×".encode(sys.stdout.encoding or "ascii")
         return (
-            {"top": "┌", "line": "─", "side": "│", "bottom": "└", "no": "✗", "minus": "−", "arrow": "◀", "bullet": "•"},
+            {
+                "top": "┌",
+                "line": "─",
+                "side": "│",
+                "bottom": "└",
+                "no": "✗",
+                "minus": "−",
+                "arrow": "◀",
+                "bullet": "•",
+                "times": "×",
+            },
             "✓",
             "·",
         )
     except (UnicodeEncodeError, LookupError):
         return (
-            {"top": "+", "line": "-", "side": "|", "bottom": "+", "no": "X", "minus": "-", "arrow": "<", "bullet": "*"},
+            {
+                "top": "+",
+                "line": "-",
+                "side": "|",
+                "bottom": "+",
+                "no": "X",
+                "minus": "-",
+                "arrow": "<",
+                "bullet": "*",
+                "times": "x",
+            },
             "OK",
             "-",
         )
 
 
 BOX, MARK_OK, DOT = _box_chars()
+
+
+def _bar_chars() -> Dict[str, Any]:
+    """Characters for the gauges: eighths of a block when the terminal can show them, else ASCII."""
+    try:
+        "█▏▎▍▌▋▊▉░".encode(sys.stdout.encoding or "ascii")
+        return {"full": "█", "parts": ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"], "empty": "░"}
+    except (UnicodeEncodeError, LookupError):
+        return {"full": "#", "parts": ["", "", "", "", "#", "#", "#", "#"], "empty": "."}
+
+
+BAR = _bar_chars()
 
 
 def column_widths(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[int]:
@@ -381,7 +414,7 @@ def table_row(cells: Sequence[Any], widths: Sequence[int], roles: Sequence[Role]
     out = []
     for cell, width, role in zip(cells, widths, roles):
         text = str(cell)
-        name = role(text) if callable(role) else role
+        name = role if role is None or isinstance(role, str) else role(text)
         out.append(paint(text, name) + " " * (width - len(text)))
     return "  ".join(out)
 
@@ -1605,8 +1638,15 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
     abs_max = (to_float(lq.get("absoluteMaxCapacity")) or 0) / 100.0
     emin, emax = effective(lq, "effectiveMinResource"), effective(lq, "effectiveMaxResource")
     b["abs_cap"], b["abs_max"] = abs_cap, abs_max
-    b["guar"] = (res(emin), res(emin, "vCores")) if emin else (abs_cap * total, abs_cap * total_vc)
-    b["max"] = (res(emax), res(emax, "vCores")) if emax else (abs_max * total, abs_max * total_vc)
+    # YARN's effective figures win when it sends them; a missing part falls back to the percentage
+    b["guar"] = (
+        (res(emin) if emin else None) or abs_cap * total,
+        (res(emin, "vCores") if emin else None) or abs_cap * total_vc,
+    )
+    b["max"] = (
+        (res(emax) if emax else None) or abs_max * total,
+        (res(emax, "vCores") if emax else None) or abs_max * total_vc,
+    )
     if total:  # YARN's effective figures win over the percentages (they differ with absolute capacities)
         b["abs_cap"], b["abs_max"] = b["guar"][0] / total, b["max"][0] / total
     b["used"] = (res(lq.get("resourcesUsed")) or 0, res(lq.get("resourcesUsed"), "vCores") or 0)
@@ -1656,7 +1696,7 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
     b["users"] = []
     ulf = to_float(lq.get("userLimitFactor")) or q.ulf  # what the ResourceManager runs with
     b["ulf"] = ulf
-    one_user = b["max"][0] if ulf <= 0 else min(ulf * b["guar"][0], b["max"][0])
+    one_user: float = b["max"][0] if ulf <= 0 else min(ulf * b["guar"][0], b["max"][0])
     # from the user's apps in this queue, for Hadoop versions without per-user numbers
     by_app: Dict[str, float] = {}
     counts: Dict[str, List[int]] = {}
@@ -2462,8 +2502,10 @@ def print_balances(
     only: Optional[List[str]] = None,
     full: bool = True,
     launcher_size: Optional[int] = None,
+    details: bool = False,
 ) -> None:
-    """The room of each queue in numbers: an overview table, then a balance sheet per queue."""
+    """The room of each queue in numbers: an overview table, then a balance sheet per queue.
+    With --queue the cards at the top answer the question, so the sheets come only with --details."""
     balances = [b for b in (queue_balance(queues[p], live, am.size, executor.size) for p in sorted(queues)) if b]
     if not balances:
         return
@@ -2518,6 +2560,10 @@ def print_balances(
     )
     if not full:
         return
+    if only and not details:
+        print()
+        print(highlight(wrap("The balance sheets (every number, step by step): run again with --details.", "  ")))
+        return
     if only:
         chosen = [b for b in balances if any(b["q"] is find_queue(queues, n) for n in only)]
     else:
@@ -2548,6 +2594,606 @@ def print_balances(
     print()
     for b in chosen:
         print_balance(b, spark_queue, launcher_queue, uses_vcores, oozie)
+
+
+# ================================================================== the queue card (--queue)
+# One screen per queue that answers "can my job run, and if not, why", in jobs rather than GB.
+# Two budgets decide it: room to START a job (its ApplicationMaster, limited by the AM limits) and
+# room to RUN it (its executors, limited by the queue and user limits and by free memory on the nodes).
+# Starting a job that then gets no executor does not help, so the card shows both side by side.
+
+
+def gauge(used: float, limit: Optional[float]) -> str:
+    """A 10-character bar and a percentage: how full a limit is."""
+    if not limit or limit <= 0:
+        return " " * 17
+    frac = max(0.0, min(1.0, used / limit))
+    cells = frac * 10
+    full = int(cells)
+    part = BAR["parts"][int((cells - full) * len(BAR["parts"]))] if full < 10 else ""
+    bar = BAR["full"] * full + part
+    return "[%s] %3d%%" % (bar + BAR["empty"] * (10 - len(bar)), round(frac * 100))
+
+
+def simulate_jobs(
+    b: Balance, user: User, am: float, ex: float, n_ex: int, launcher: float = 0, cap: int = 200
+) -> Tuple[int, int, str, str, Dict[str, float], Dict[str, float]]:
+    """Start jobs one by one, each with its AM (plus an Oozie launcher when given) and n_ex executors.
+    Returns (jobs whose AM can start, jobs that also get their executors, what stops the start,
+    what stops the executors, what was left when the start stopped, what was left when the
+    executors stopped). "What was left" has the jobs before it, so a reason can say "after them"."""
+    nodes = sorted(b["nodes_free"], reverse=True)
+    user_am_left = (user["am_limit"] - user["am_used"]) if user["am_limit"] else float("inf")
+    pool_left = (b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else float("inf")
+    room = b["room"]
+    user_left = (user["limit"] - user["used"]) if user["limit"] else float("inf")
+    starter = am + launcher
+    started = running = 0
+    stop_start = stop_run = ""
+    at_start: Dict[str, float] = {}
+    at_run: Dict[str, float] = {}
+
+    def left(jobs: int) -> Dict[str, float]:
+        return {
+            "user_am": user_am_left,
+            "pool": pool_left,
+            "room": room,
+            "user": user_left,
+            "node": max(nodes or [0]),
+            "jobs": jobs,
+        }
+
+    if b["q"].state != "RUNNING":
+        return 0, 0, "state", "state", left(0), left(0)
+    while started < cap:
+        if user_am_left < starter:
+            stop_start, at_start = "user_am", left(started)
+            break
+        if pool_left < starter:
+            stop_start, at_start = "pool", left(started)
+            break
+        if min(room, user_left) < starter:
+            stop_start, at_start = ("user" if user_left < room else "room"), left(started)
+            break
+        placed = []
+        for size in ([launcher] if launcher else []) + [am]:
+            big = max(range(len(nodes)), key=lambda i: nodes[i]) if nodes else -1
+            if big < 0 or nodes[big] < size:
+                break
+            nodes[big] -= size
+            placed.append((big, size))
+        if len(placed) < (2 if launcher else 1):
+            for i, size in placed:
+                nodes[i] += size
+            stop_start, at_start = "node", left(started)
+            break
+        started += 1
+        user_am_left -= starter
+        pool_left -= starter
+        room -= starter
+        user_left -= starter
+        if stop_run:
+            continue  # later jobs can start, but the ones before already found no executor room
+        got = 0
+        for _ in range(n_ex):
+            if min(room, user_left) < ex:
+                stop_run, at_run = ("user" if user_left < room else "room"), left(running)
+                break
+            big = max(range(len(nodes)), key=lambda i: nodes[i]) if nodes else -1
+            if big < 0 or nodes[big] < ex:
+                stop_run, at_run = "node", left(running)
+                break
+            nodes[big] -= ex
+            room -= ex
+            user_left -= ex
+            got += 1
+        if got == n_ex:
+            running += 1
+    return started, running, stop_start, stop_run, at_start, at_run
+
+
+def limit_text(kind: str, at: Dict[str, float], name: str, need: float, what: str, own: str = "") -> str:
+    """A short reason: which limit has too little left, after the jobs before it (when any) and, for an
+    executor, after the job's own starter (own names it)."""
+    texts = {
+        "state": "the queue is not RUNNING",
+        "user_am": "%s's job-starter limit has only %s left" % (name, gb(max(0, at.get("user_am", 0)))),
+        "pool": "the queue's job starters (AM pool) have only %s left" % gb(max(0, at.get("pool", 0))),
+        "room": "the queue has only %s of memory left" % gb(max(0, at.get("room", 0))),
+        "user": "%s's share of the queue has only %s left" % (name, gb(max(0, at.get("user", 0)))),
+        "node": "the most free on one node is %s" % gb(max(0, at.get("node", 0))),
+    }
+    text = texts.get(kind, "a limit is full")
+    if kind != "state":
+        text += ", and %s needs %s" % (what, gb(need))
+    jobs = int(at.get("jobs", 0))
+    before = ["the %d new job%s above" % (jobs, "" if jobs == 1 else "s")] if jobs else []
+    before += [own] if own else []
+    if before:
+        text = "after %s, %s" % (" and ".join(before), text)
+    return text
+
+
+FORMULA_LABEL_W = 26  # the "what" column of the queue card
+FORMULA_VALUE_W = 10  # the result column, right-aligned
+
+
+def formula_rows(rows: Sequence[Tuple[Optional[str], str, str, str]], ind: str = "    ") -> None:
+    """Print aligned rows: mark, what, formula (property names and live values), = result.
+    A long formula wraps inside its column; the result stays on the first line."""
+    label_w = max([FORMULA_LABEL_W] + [len(r[1]) + 2 for r in rows])
+    width = WIDTH - len(ind) - MARK_W - 1 - label_w - FORMULA_VALUE_W - 3
+    for kind, label, formula, value in rows:
+        lines = textwrap.wrap(formula, width, break_on_hyphens=False, break_long_words=False) or [""]
+        head = mark(kind) if kind else " " * MARK_W
+        print(
+            ind
+            + head
+            + " "
+            + paint(label.ljust(label_w), "label")
+            + highlight(lines[0].ljust(width))
+            + (" = " if value else "   ")
+            + paint(value.rjust(FORMULA_VALUE_W), "value")
+        )
+        for more in lines[1:]:
+            print(ind + " " * (MARK_W + 1 + label_w) + highlight(more))
+
+
+def block_title(number: int, title: str, kind: Optional[str], status: str) -> None:
+    print()
+    print(
+        "  "
+        + paint("%d. %s" % (number, title), "label")
+        + "   "
+        + mark(kind)
+        + " "
+        + paint(status, "good" if kind == "ok" else "bad")
+    )
+
+
+def am_limit_rows(
+    free: float, am: float, oozie_need: Optional[float], name: str
+) -> List[Tuple[Optional[str], str, str, str]]:
+    """The "how many fit" rows of an AM block: Oozie jobs (launcher + Spark AM) first when Oozie is used."""
+    rows: List[Tuple[Optional[str], str, str, str]] = []
+    if oozie_need:
+        n = int(max(0.0, free) // oozie_need)
+        rows.append(
+            (
+                "ok" if n else "no",
+                "New Oozie jobs that fit",
+                "%s / %s (launcher + Spark AM)" % (gb(max(0.0, free)), gb(oozie_need)),
+                str(n),
+            )
+        )
+    n = int(max(0.0, free) // am)
+    rows.append(
+        ("ok" if n else "no", "New spark-submit jobs", "%s / %s (Spark AM only)" % (gb(max(0.0, free)), gb(am)), str(n))
+    )
+    return rows
+
+
+def print_queue_card(
+    b: Balance, user: User, am_c: Container, oozie: Optional[Tuple[Balance, float]], uses_vcores: bool
+) -> None:
+    q = b["q"]
+    am = float(b["am_size"])
+    name = "a new user" if user["name"] == NEW_USER else user["name"]
+    who_text = "no jobs now (checked for a new user)" if user["name"] == NEW_USER else "user " + name
+    title = "QUEUE %s  %s  %s" % (q.path, DOT, who_text)
+    print()
+    print(paint(title, "section"))
+    print(paint(BOX["line"] * len(title), "rule"))
+
+    # An Oozie Spark job first starts its launcher, an AM of its own, then the Spark AM. When the
+    # launcher runs in this queue, both count against the AM limits here.
+    l_size = oozie[1] if oozie else 0.0
+    l_here = oozie is not None and oozie[0]["q"] is q
+    oozie_need = (l_size + am) if l_here else None
+    need = oozie_need or am  # what the main kind of job needs from the AM limits
+    kind_text = "Spark job from Oozie" if l_here else "Spark job"
+    starters, _, stop_start, _, at_start, _ = simulate_jobs(b, user, am, 0, 0, l_size if l_here else 0)
+    jobs_now = int(user["apps"] or 0)
+    user_am_left = (user["am_limit"] - user["am_used"]) if user["am_limit"] else None
+    pool_left = (b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else None
+    user_left = (user["limit"] - user["used"]) if user["limit"] else None
+    q_left = b["max"][0] - b["used"][0]
+    parts = [("free in the queue", q_left)]
+    parts += [("free under %s" % p[0], p[4][0]) for p in b["parents"]]
+    if user_left is not None:
+        parts.append(("free in %s's share" % name, user_left))
+    parts.append(("free in the cluster", b["free"][0]))
+    avail = max(0.0, min(v for _, v in parts))
+    avail_by = min(parts, key=lambda p: p[1])[0]
+    never = bool(l_here and user["am_limit"] and oozie_need and oozie_need > user["am_limit"])
+
+    # ---- the answer
+    print()
+    what_needs = (
+        "a new Oozie job needs %s (launcher %s + Spark AM %s)" % (gb(need), gb(l_size), gb(am))
+        if l_here
+        else "a new Spark AM needs %s" % gb(am)
+    )
+    if never:
+        print("  " + paint(BOX["no"] + " A new %s can NEVER start here now." % kind_text, "PROBLEM"))
+        bullets(
+            [
+                "Why: %s's AM limit is %s in all, and %s." % (name, gb(user["am_limit"]), what_needs),
+                "The launcher starts, and the Spark AM then waits for good. See What you can do.",
+            ],
+            "    ",
+        )
+    elif starters == 0:
+        print("  " + paint(BOX["no"] + " A new %s would WAIT now (state ACCEPTED)." % kind_text, "PROBLEM"))
+        if stop_start == "user_am":
+            why = "%s already runs %d job%s, and its AM limit has %s free; %s." % (
+                name,
+                jobs_now,
+                "" if jobs_now == 1 else "s",
+                gb(max(0.0, user_am_left or 0.0)),
+                what_needs,
+            )
+        elif stop_start == "pool":
+            why = "the AM limit of the whole queue has %s free; %s." % (gb(max(0.0, pool_left or 0.0)), what_needs)
+        else:
+            why = limit_text(stop_start, at_start, name, need, "it") + "."
+        bullets(["Why: " + why, "Memory available to %s now: %s (%s)." % (name, gb(avail), avail_by)], "    ")
+    elif avail - need <= 0:
+        print("  " + paint("! A new %s would START, but no memory is left for its executors." % kind_text, "bad"))
+        bullets(["Memory available to %s now: %s (%s); %s." % (name, gb(avail), avail_by, what_needs)], "    ")
+    else:
+        print("  " + paint(MARK_OK + " A new %s can START now." % kind_text, "good"))
+        bullets(
+            [
+                "Memory left for its executors: %s (available %s, minus %s for %s)."
+                % (gb(avail - need), gb(avail), gb(need), "the launcher and Spark AM" if l_here else "the Spark AM"),
+                "The largest free space on one node: %s." % gb(b["node_free"]),
+            ],
+            "    ",
+        )
+
+    x = " %s " % BOX["times"]
+    size_rows: List[Tuple[Optional[str], str, str, str]] = []
+    if l_here:
+        size_rows.append((None, "Oozie launcher (an AM)", "oozie.launcher.default.memory.mb", gb(l_size)))
+    am_formula = "%s %s + overhead %s" % (am_c.heap_note, mb(am_c.heap), mb(am_c.overhead))
+    if am_c.size != am_c.total:
+        am_formula += ", rounded up to a multiple of yarn.scheduler.minimum-allocation-mb"
+    size_rows.append((None, "Spark AM", am_formula, gb(am)))
+    if l_here:
+        size_rows.append(
+            (None, "One Oozie job needs", "launcher %s + Spark AM %s" % (gb(l_size), gb(am)), gb(l_size + am))
+        )
+
+    # ---- 1: the user's AM limit
+    if user["am_limit"]:
+        free_u = max(0.0, user_am_left or 0.0)
+        n = int(free_u // need)
+        status = (
+            ("NEVER fits an Oozie job: the whole limit is %s" % gb(user["am_limit"]))
+            if never
+            else (
+                "room for %d new %s"
+                % (n, "Oozie job" + ("" if n == 1 else "s") if l_here else "AM" + ("" if n == 1 else "s"))
+                if n
+                else "full for a new %s" % ("Oozie job" if l_here else "AM")
+            )
+        )
+        block_title(1, "AM limit of %s" % name, "ok" if n else "no", status)
+        active = max(1, len([u for u in b["users"] if u["apps"]]))
+        share = max(q.min_user_pct / 100.0, 1.0 / active)
+        guess = b["guar"][0] * (b["am_pct"] or 0) * max(b["ulf"], 0) * share
+        if b["am_limit"]:
+            guess = min(guess, b["am_limit"])
+        rows: List[Tuple[Optional[str], str, str, str]] = (
+            list(size_rows)
+            + [
+                (None, "Guaranteed capacity", "the queue's capacity, as a share of the cluster", gb(b["guar"][0])),
+                (None, "AM percent", "maximum-am-resource-percent", pct(b["am_pct"])),
+                (None, "User limit factor", "user-limit-factor", "%g" % b["ulf"]),
+                (
+                    None,
+                    "User share",
+                    "the larger of minimum-user-limit-percent %g%% and 1 / %d active user%s"
+                    % (q.min_user_pct, active, "" if active == 1 else "s"),
+                    pct(share),
+                ),
+                (
+                    None,
+                    "Limit by the formula",
+                    x.join([gb(b["guar"][0]), pct(b["am_pct"]), "%g" % b["ulf"], pct(share)])
+                    + (" (at most the queue's AM limit)" if b["am_limit"] and guess >= b["am_limit"] else ""),
+                    gb(guess),
+                ),
+                (
+                    None,
+                    "Limit (YARN's figure)",
+                    "userAMResourceLimit, from the ResourceManager: this one counts",
+                    gb(user["am_limit"]),
+                ),
+                (
+                    None,
+                    "Used",
+                    "the AMs of %s's %d running app%s (launchers and Spark AMs)"
+                    % (name, jobs_now, "" if jobs_now == 1 else "s"),
+                    gb(user["am_used"]),
+                ),
+                (
+                    "ok" if free_u >= need else "no",
+                    "Free",
+                    "%s - %s" % (gb(user["am_limit"]), gb(user["am_used"])),
+                    gb(free_u),
+                ),
+            ]
+            + am_limit_rows(free_u, am, oozie_need, name)
+        )
+        formula_rows(rows)
+
+    # ---- 2: the queue's AM limit
+    if b["am_limit"] is not None:
+        free_q = max(0.0, pool_left or 0.0)
+        n = int(free_q // need)
+        block_title(
+            2,
+            "AM limit of the whole queue",
+            "ok" if n else "no",
+            (
+                "room for %d new %s"
+                % (n, "Oozie job" + ("" if n == 1 else "s") if l_here else "AM" + ("" if n == 1 else "s"))
+            )
+            if n
+            else "full for a new %s" % ("Oozie job" if l_here else "AM"),
+        )
+        holders = ", ".join("%s %s" % (u["name"], gb(u["am_used"])) for u in b["users"] if u["am_used"])
+        n_apps = (q.live or {}).get("numActiveApplications", "?")
+        rows = [
+            (None, "AM percent", "maximum-am-resource-percent", pct(b["am_pct"])),
+            (None, "Guaranteed capacity", "the queue's capacity, as a share of the cluster", gb(b["guar"][0])),
+            (
+                None,
+                "Limit by the formula",
+                x.join([pct(b["am_pct"]), gb(b["guar"][0])])
+                + " (YARN may use more when the queue uses more, up to its max)",
+                gb((b["am_pct"] or 0) * b["guar"][0]),
+            ),
+            (
+                None,
+                "Limit (YARN's figure)",
+                "AMResourceLimit, from the ResourceManager: this one counts",
+                gb(b["am_limit"]),
+            ),
+            (
+                None,
+                "Used",
+                "%s running AM%s%s" % (n_apps, "" if n_apps == 1 else "s", " (%s)" % holders if holders else ""),
+                gb(b["am_used"]),
+            ),
+            ("ok" if free_q >= need else "no", "Free", "%s - %s" % (gb(b["am_limit"]), gb(b["am_used"])), gb(free_q)),
+        ] + am_limit_rows(free_q, am, oozie_need, name)
+        formula_rows(rows)
+        if n and user_am_left is not None and user_am_left < need:
+            bullets(["%s cannot use this room: its own AM limit (block 1) is the one that is short." % name], "      ")
+
+    # ---- 3: memory
+    block_title(
+        3,
+        "Memory available to %s" % name,
+        "ok" if avail > need else "no",
+        "%s free now" % gb(avail) if avail > 0 else "none free now",
+    )
+    if b["ulf"] > 0:
+        share_formula = "user-limit-factor %g %s guaranteed %s, at most the queue max" % (
+            b["ulf"],
+            BOX["times"],
+            gb(b["guar"][0]),
+        )
+    else:
+        share_formula = "user-limit-factor %g: no user limit, so the queue max" % b["ulf"]
+    rows = [
+        (
+            None,
+            "Queue max",
+            "maximum-capacity %s %s cluster %s" % (pct(b["abs_max"]), BOX["times"], gb(b["total"])),
+            gb(b["max"][0]),
+        ),
+        (None, "Used by the queue", "all running containers in %s" % q.path, gb(b["used"][0])),
+        (
+            "ok" if q_left > 0 else "no",
+            "Free in the queue",
+            "%s - %s" % (gb(b["max"][0]), gb(b["used"][0])),
+            gb(max(0.0, q_left)),
+        ),
+    ]
+    for path, _pmax, pm, pused, pleft in b["parents"]:
+        rows.append(
+            (
+                "ok" if pleft[0] > 0 else "no",
+                "Free under %s" % path,
+                "its max %s - used by all queues under it %s" % (gb(pm[0]), gb(pused[0])),
+                gb(max(0.0, pleft[0])),
+            )
+        )
+    if user["limit"]:
+        rows += [
+            (None, "%s's share" % name, share_formula, gb(user["limit"])),
+            (
+                None,
+                "Used by %s" % name,
+                "its %d running app%s" % (jobs_now, "" if jobs_now == 1 else "s"),
+                gb(user["used"]),
+            ),
+            (
+                "ok" if (user_left or 0) > 0 else "no",
+                "Free in %s's share" % name,
+                "%s - %s" % (gb(user["limit"]), gb(user["used"])),
+                gb(max(0.0, user_left or 0.0)),
+            ),
+        ]
+    rows += [
+        (
+            "ok" if b["free"][0] > 0 else "no",
+            "Free in the cluster",
+            "memory that no container uses (of %s)" % gb(b["total"]),
+            gb(b["free"][0]),
+        ),
+        (
+            "ok" if avail > 0 else "no",
+            "Available to %s now" % name,
+            "the smallest of the free amounts above (%s)" % avail_by,
+            gb(avail),
+        ),
+        (
+            "ok" if avail - need > 0 else "no",
+            "Left for executors",
+            "%s - %s (%s)"
+            % (gb(avail), gb(need), "launcher + Spark AM of a new Oozie job" if l_here else "Spark AM of a new job"),
+            gb(max(0.0, avail - need)),
+        ),
+        (None, "Largest free on one node", "a container (AM or executor) must fit on one node", gb(b["node_free"])),
+    ]
+    formula_rows(rows)
+
+    # ---- notes
+    notes: List[Union[str, Tuple[Optional[str], str]]] = []
+    if user["am_limit"] and user["limit"]:
+        most = int(user["am_limit"] // need)
+        if most >= 2:
+            notes.append(
+                "If %s ran %d %s (the most its AM limit allows), each would have about %s of memory for "
+                "executors (its share %s, split %d ways, minus the AMs)."
+                % (
+                    name,
+                    most,
+                    "Oozie jobs" if l_here else "jobs",
+                    gb(max(0.0, (user["limit"] - most * need) / most)),
+                    gb(user["limit"]),
+                    most,
+                )
+            )
+    if oozie and not l_here:
+        notes.append(
+            "Oozie launchers run in %s, so here only the Spark AM counts against the AM limits." % oozie[0]["q"].path
+        )
+    if notes:
+        print()
+        print("  " + paint("Notes", "label"))
+        bullets(notes, "    ")
+
+    # ---- what to do
+    fixes: List[str] = []
+    prefix = "yarn.scheduler.capacity.%s." % q.path
+    short_user_am = user["am_limit"] and (never or (starters == 0 and stop_start == "user_am"))
+    short_pool = starters == 0 and stop_start == "pool"
+    if short_user_am:
+        if not never:
+            fixes.append("Wait: when one of %s's jobs ends, its AMs free up." % name)
+        target = max(user["am_used"], 0.0) + need  # room for one more job of the main kind
+        if b["ulf"] > 0:
+            new_ulf = max(math.ceil(b["ulf"] * target / user["am_limit"] * 10) / 10.0, b["ulf"] + 0.1)
+            fixes.append(
+                "Raise %suser-limit-factor %g -> %g: %s's AM limit becomes about %s, room for 1 more %s. "
+                "It also raises %s's share of the queue."
+                % (
+                    prefix,
+                    b["ulf"],
+                    new_ulf,
+                    name,
+                    gb(user["am_limit"] * new_ulf / b["ulf"]),
+                    "Oozie job" if l_here else "job",
+                    name,
+                )
+            )
+        if b["am_pct"]:
+            new_pct = max(math.ceil(b["am_pct"] * target / user["am_limit"] * 100) / 100.0, b["am_pct"] + 0.01)
+            if new_pct <= 1.0:
+                fixes.append(
+                    "Or raise %smaximum-am-resource-percent %g -> %g: both AM limits grow by the same factor."
+                    % (prefix, b["am_pct"], new_pct)
+                )
+    if short_pool and b["am_pct"]:
+        target = b["am_used"] + need
+        new_pct = max(math.ceil(b["am_pct"] * target / b["am_limit"] * 100) / 100.0, b["am_pct"] + 0.01)
+        fixes.append(
+            "Wait for a job in the queue to end"
+            + (
+                ", or raise %smaximum-am-resource-percent %g -> %g (room for 1 more %s)."
+                % (prefix, b["am_pct"], new_pct, "Oozie job" if l_here else "job")
+                if new_pct <= 1.0
+                else "."
+            )
+        )
+    if l_here and (short_user_am or short_pool):
+        free_for = (user_am_left if short_user_am else pool_left) or 0.0
+        fit_launcher = int((free_for - am) // 256) * 256 if not never else int((user["am_limit"] - am) // 256) * 256
+        if fit_launcher >= 512:
+            fixes.append(
+                "Or give the launchers less memory: oozie.launcher.default.memory.mb %d -> %d (in "
+                "oozie-site.xml, or oozie.launcher.memory.mb in one workflow action). A launcher only "
+                "waits for its Spark job, so it rarely needs 2 GB." % (int(l_size), fit_launcher)
+            )
+    if (starters == 0 and stop_start in ("room", "node", "user")) or avail - need <= 0:
+        if "share" in avail_by:
+            fixes.append(
+                "Raise %suser-limit-factor (now %g) so %s may use more of the queue." % (prefix, b["ulf"], name)
+            )
+        elif avail_by == "free in the queue" and b["abs_max"] < 0.999:
+            fixes.append(
+                "Wait until other jobs in the queue end, or raise %smaximum-capacity (now %s of the cluster)."
+                % (prefix, pct(b["abs_max"]))
+            )
+        elif avail_by.startswith("free under"):
+            fixes.append("Wait until jobs under the parent queue end, or raise its maximum-capacity.")
+        else:
+            fixes.append("Wait until other containers end. For more room for good, add nodes to the cluster.")
+    if fixes:
+        print()
+        print("  " + paint("What you can do", "label"))
+        bullets(fixes, "    ", numbered=True)
+    print()
+    print(highlight(wrap("All numbers in detail (the balance sheet): run again with --details.", "  ")))
+    if not uses_vcores:
+        print(highlight(wrap("Only memory counts here: the resource calculator ignores vcores.", "  ")))
+
+
+def print_queue_cards(
+    names: List[str],
+    queues: Dict[str, Queue],
+    live: Optional[Live],
+    am: Container,
+    executor: Container,
+    files: Dict[str, ConfigFile],
+    l_size: Optional[int],
+) -> None:
+    """One card per queue named with --queue, and per user with apps in it (or a new user)."""
+    print()
+    if not live:
+        print(paint(wrap("The queue cards need live data from the ResourceManager (see above).", "  "), "bad"))
+        return
+    launcher_q = (
+        find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
+        if files["oozie"].props is not None
+        else None
+    )
+    b_launch = queue_balance(launcher_q, live, am.size, executor.size) if launcher_q else None
+    oozie = (b_launch, float(l_size)) if b_launch and l_size else None
+    uses_vcores = "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower()
+    for name in names:
+        q = find_queue(queues, name)
+        b = queue_balance(q, live, am.size, executor.size) if q else None
+        if q is None or b is None:
+            print(
+                paint(
+                    wrap(
+                        "Queue %s: no such leaf queue in the live data. Leaf queues: %s."
+                        % (name, ", ".join(sorted(queues))),
+                        "  ",
+                    ),
+                    "bad",
+                )
+            )
+            continue
+        for user in sorted(b["users"], key=lambda u: -u["used"]) or [user_in(b, None)]:
+            print_queue_card(b, user, am, oozie, uses_vcores)
 
 
 # What YARN says when an app waits in ACCEPTED, in plain words
@@ -3236,8 +3882,13 @@ def main() -> None:
         "--queue",
         action="append",
         metavar="NAME",
-        help="show the balance sheet of this queue (more than once for more queues). Default: "
-        "Spark's queue, the Oozie launcher queue and queues with apps",
+        help="start the report with a one-screen card for this queue: can a new job run now, and if not, "
+        "why (more than once for more queues). Needs live data",
+    )
+    ap.add_argument(
+        "--details",
+        action="store_true",
+        help="also print the balance sheets: every number behind the queue cards, worked out step by step",
     )
     ap.add_argument(
         "--watch",
@@ -3280,6 +3931,16 @@ def main() -> None:
     findings = find_problems(files, queues, live, executor, am, deploy)
 
     print_header(emr, files, live, live_errors, live_wanted)
+    if args.queue:
+        print_queue_cards(
+            args.queue,
+            queues,
+            live,
+            am,
+            executor,
+            files,
+            launcher_size(files, min_alloc),
+        )
     print_findings(findings)
     print_containers(executor, am, deploy, files["spark"])
     if queues:
@@ -3305,6 +3966,7 @@ def main() -> None:
             "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower(),
             only=args.queue,
             launcher_size=launcher_size(files, min_alloc),
+            details=args.details,
         )
     if live:
         print_apps(live, queues)
