@@ -2602,10 +2602,11 @@ def gauge(used: float, limit: Optional[float]) -> str:
 
 def simulate_jobs(
     b: Balance, user: User, am: float, ex: float, n_ex: int, launcher: float = 0, cap: int = 200
-) -> Tuple[int, int, str, str]:
+) -> Tuple[int, int, str, str, Dict[str, float], Dict[str, float]]:
     """Start jobs one by one, each with its AM (plus an Oozie launcher when given) and n_ex executors.
     Returns (jobs whose AM can start, jobs that also get their executors, what stops the start,
-    what stops the executors)."""
+    what stops the executors, what was left when the start stopped, what was left when the
+    executors stopped). "What was left" has the jobs before it, so a reason can say "after them"."""
     nodes = sorted(b["nodes_free"], reverse=True)
     user_am_left = (user["am_limit"] - user["am_used"]) if user["am_limit"] else float("inf")
     pool_left = (b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else float("inf")
@@ -2614,17 +2615,30 @@ def simulate_jobs(
     starter = am + launcher
     started = running = 0
     stop_start = stop_run = ""
+    at_start: Dict[str, float] = {}
+    at_run: Dict[str, float] = {}
+
+    def left(jobs: int) -> Dict[str, float]:
+        return {
+            "user_am": user_am_left,
+            "pool": pool_left,
+            "room": room,
+            "user": user_left,
+            "node": max(nodes or [0]),
+            "jobs": jobs,
+        }
+
     if b["q"].state != "RUNNING":
-        return 0, 0, "state", "state"
+        return 0, 0, "state", "state", left(0), left(0)
     while started < cap:
         if user_am_left < starter:
-            stop_start = "user_am"
+            stop_start, at_start = "user_am", left(started)
             break
         if pool_left < starter:
-            stop_start = "pool"
+            stop_start, at_start = "pool", left(started)
             break
         if min(room, user_left) < starter:
-            stop_start = "user" if user_left < room else "room"
+            stop_start, at_start = ("user" if user_left < room else "room"), left(started)
             break
         placed = []
         for size in ([launcher] if launcher else []) + [am]:
@@ -2636,7 +2650,7 @@ def simulate_jobs(
         if len(placed) < (2 if launcher else 1):
             for i, size in placed:
                 nodes[i] += size
-            stop_start = "node"
+            stop_start, at_start = "node", left(started)
             break
         started += 1
         user_am_left -= starter
@@ -2648,11 +2662,11 @@ def simulate_jobs(
         got = 0
         for _ in range(n_ex):
             if min(room, user_left) < ex:
-                stop_run = "user" if user_left < room else "room"
+                stop_run, at_run = ("user" if user_left < room else "room"), left(running)
                 break
             big = max(range(len(nodes)), key=lambda i: nodes[i]) if nodes else -1
             if big < 0 or nodes[big] < ex:
-                stop_run = "node"
+                stop_run, at_run = "node", left(running)
                 break
             nodes[big] -= ex
             room -= ex
@@ -2660,7 +2674,29 @@ def simulate_jobs(
             got += 1
         if got == n_ex:
             running += 1
-    return started, running, stop_start, stop_run
+    return started, running, stop_start, stop_run, at_start, at_run
+
+
+def limit_text(kind: str, at: Dict[str, float], name: str, need: float, what: str, own: str = "") -> str:
+    """A short reason: which limit has too little left, after the jobs before it (when any) and, for an
+    executor, after the job's own starter (own names it)."""
+    texts = {
+        "state": "the queue is not RUNNING",
+        "user_am": "%s's job-starter limit has only %s left" % (name, gb(max(0, at.get("user_am", 0)))),
+        "pool": "the queue's job starters (AM pool) have only %s left" % gb(max(0, at.get("pool", 0))),
+        "room": "the queue has only %s of memory left" % gb(max(0, at.get("room", 0))),
+        "user": "%s's share of the queue has only %s left" % (name, gb(max(0, at.get("user", 0)))),
+        "node": "the most free on one node is %s" % gb(max(0, at.get("node", 0))),
+    }
+    text = texts.get(kind, "a limit is full")
+    if kind != "state":
+        text += ", and %s needs %s" % (what, gb(need))
+    jobs = int(at.get("jobs", 0))
+    before = ["the %d new job%s above" % (jobs, "" if jobs == 1 else "s")] if jobs else []
+    before += [own] if own else []
+    if before:
+        text = "after %s, %s" % (" and ".join(before), text)
+    return text
 
 
 def most_at_once(b: Balance, user: User, am: float, ex: float, n_ex: int, launcher: float = 0) -> Tuple[int, int]:
@@ -2687,7 +2723,7 @@ def print_queue_card(
     print(paint(title, "section"))
     print(paint(BOX["line"] * len(title), "rule"))
 
-    started, running, stop_start, stop_run = simulate_jobs(b, user, am, ex, n_ex)
+    started, running, stop_start, stop_run, at_start, at_run = simulate_jobs(b, user, am, ex, n_ex)
     by_starters, by_memory = most_at_once(b, user, am, ex, n_ex)
     user_am_left = (user["am_limit"] - user["am_used"]) if user["am_limit"] else None
     pool_left = (b["am_limit"] - b["am_used"]) if b["am_limit"] is not None else None
@@ -2714,11 +2750,8 @@ def print_queue_card(
         "node": "no node has %s free for the job starter" % gb(am),
     }
     run_why = {
-        "room": "the queue has only %s of memory left, less than one executor (%s)" % (gb(b["room"]), gb(ex)),
-        "user": "%s's share of the queue has only %s left, less than one executor (%s)"
-        % (name, gb(max(0, user["limit"] - user["used"])), gb(ex)),
-        "node": "no node has %s free for an executor (the most free on one node: %s)" % (gb(ex), gb(b["node_free"])),
-        "state": "",
+        kind: limit_text(kind, at_run, name, ex, "one executor", "its own job starter")
+        for kind in ("room", "user", "node", "state")
     }
     print()
     if started == 0:
@@ -2729,7 +2762,14 @@ def print_queue_card(
         user_left = (user["limit"] - user["used"]) if user["limit"] else float("inf")
         if stop_start != "state" and (min(b["room"], user_left) < ex or b["node_free"] < ex):
             run_stop = "user" if user_left < min(b["room"], ex) else ("room" if b["room"] < ex else "node")
-            reasons.append(("no", "And even if it could start, it would get no executor now: %s." % run_why[run_stop]))
+            now = {"room": b["room"], "user": user_left, "node": b["node_free"], "jobs": 0}
+            reasons.append(
+                (
+                    "no",
+                    "And even if it could start, it would get no executor now: %s."
+                    % limit_text(run_stop, now, name, ex, "one executor"),
+                )
+            )
         bullets(reasons, "    ")
     elif running == 0:
         print("  " + paint("! A new Spark job would START, but get no executor now, so it would do nothing.", "bad"))
@@ -2852,7 +2892,9 @@ def print_queue_card(
     if oozie:
         b_l, l_size = oozie
         same = b_l["q"] is q
-        o_started, o_running, _, _ = simulate_jobs(b, user, am, ex, n_ex, l_size if same else 0)
+        o_started, o_running, o_stop_start, o_stop_run, o_at_start, o_at_run = simulate_jobs(
+            b, user, am, ex, n_ex, l_size if same else 0
+        )
         o_starters, _ = most_at_once(b, user, am, ex, n_ex, l_size if same else 0)
         if same and o_starters == 0:
             lines.append(
@@ -2866,8 +2908,27 @@ def print_queue_card(
             lines.append(
                 (
                     "ok" if o_running else "no",
-                    "From Oozie (a launcher of %s first%s): %d more can start and run now."
-                    % (gb(l_size), ", in the same queue" if same else " in " + b_l["q"].path, o_running),
+                    "From Oozie (a launcher of %s first%s): %d more can start and run now%s."
+                    % (
+                        gb(l_size),
+                        ", in the same queue" if same else " in " + b_l["q"].path,
+                        o_running,
+                        ""
+                        if o_running
+                        else (
+                            ": "
+                            + limit_text(
+                                o_stop_start,
+                                o_at_start,
+                                name,
+                                am + (l_size if same else 0),
+                                "the launcher and job starter",
+                            )
+                            if o_started == 0
+                            else ": "
+                            + limit_text(o_stop_run, o_at_run, name, ex, "one executor", "its launcher and job starter")
+                        ),
+                    ),
                 )
             )
     bullets(lines, "    ")

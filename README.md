@@ -291,7 +291,7 @@ QUEUE root.default  ·  user svc_spark
     • Why: svc_spark already runs 3 jobs, and its job-starter limit has 0.00 GB left (2.62 GB of
       2.62 GB used); one job starter needs 0.88 GB.
     ✗ And even if it could start, it would get no executor now: the queue has only 3.12 GB of memory
-      left, less than one executor (5.12 GB).
+      left, and one executor needs 5.12 GB.
 
   1. Room to START jobs
     • Each job first starts one job starter (its ApplicationMaster, AM) of 0.88 GB.
@@ -335,7 +335,8 @@ QUEUE root.default  ·  user svc_spark
 ─────────────────────────────────────
 
   ! A new Spark job would START, but get no executor now, so it would do nothing.
-    • Why: no node has 5.12 GB free for an executor (the most free on one node: 5.00 GB).
+    • Why: after its own job starter, the most free on one node is 5.00 GB, and one executor needs
+      5.12 GB.
 
   1. Room to START jobs
     • Each job first starts one job starter (its ApplicationMaster, AM) of 0.88 GB.
@@ -359,7 +360,9 @@ QUEUE root.default  ·  user svc_spark
       executors to 4.
     ✗ The job-starter limits allow more jobs than memory can feed: the extra jobs would start and
       sit idle, holding memory. A lower maximum-am-resource-percent avoids that.
-    ✗ From Oozie (a launcher of 2.00 GB first, in the same queue): 0 more can start and run now.
+    ✗ From Oozie (a launcher of 2.00 GB first, in the same queue): 0 more can start and run now:
+      after its launcher and job starter, the most free on one node is 4.12 GB, and one executor
+      needs 5.12 GB.
 
   4. What you can do
     1. Wait until other containers end. For more room for good, add nodes to the cluster.
