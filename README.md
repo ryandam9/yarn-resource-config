@@ -9,7 +9,7 @@ The report starts with the findings. Each finding says what is wrong (or fine), 
 because of it, and what to do. Then come tables of what one Spark app asks for, the queues, the
 nodes and the settings behind the findings, and a short list of the terms used.
 
-Background: [Why your Spark app gets no YARN resources](https://ryandam9.github.io/Guides/docs/yarn_resources_explained_by_claude.html).
+Background: [Why your Spark app gets no YARN resources](../docs/yarn_resources_explained_by_claude.html).
 
 ## The script is read-only
 
