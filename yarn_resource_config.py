@@ -9,14 +9,14 @@ nodes and the settings behind the findings, with a short list of the terms at th
 
 Run it on the primary node of an Amazon EMR cluster (or on a Hadoop edge node):
 
-    python3 yarn_spark_settings.py              # config files + live data on EMR
-    python3 yarn_spark_settings.py --no-live    # config files only
-    python3 yarn_spark_settings.py --live --rm http://<resourcemanager-host>:8088
-    python3 yarn_spark_settings.py --all        # also list every other property in the files
-    python3 yarn_spark_settings.py --color never  # no colour (it is on only on a terminal anyway)
-    python3 yarn_spark_settings.py --watch 30   # queues and apps, redrawn every 30 s (like yarn top)
-    python3 yarn_spark_settings.py --queue etl  # cards for queue etl only: can a new job start there?
-    python3 yarn_spark_settings.py --details    # also the balance sheets behind the cards
+    python3 yarn_resource_config.py              # config files + live data on EMR
+    python3 yarn_resource_config.py --no-live    # config files only
+    python3 yarn_resource_config.py --live --rm http://<resourcemanager-host>:8088
+    python3 yarn_resource_config.py --all        # also list every other property in the files
+    python3 yarn_resource_config.py --color never  # no colour (it is on only on a terminal anyway)
+    python3 yarn_resource_config.py --watch 30   # queues and apps, redrawn every 30 s (like yarn top)
+    python3 yarn_resource_config.py --queue etl  # cards for queue etl only: can a new job start there?
+    python3 yarn_resource_config.py --details    # also the balance sheets behind the cards
 
 The script needs Python 3.6 or later (EMR 6 and 7 have it) and uses only the standard library.
 
@@ -30,9 +30,9 @@ python3, so nothing is written on the node. The step runs on the primary node, n
 it takes a step slot: with a step concurrency of 1 it waits behind running steps, and other steps
 wait for it (it takes a few seconds).
 
-    aws s3 cp yarn_spark_settings.py s3://<bucket>/tools/
+    aws s3 cp yarn_resource_config.py s3://<bucket>/tools/
     aws emr add-steps --cluster-id j-XXXXXXXX --steps \\
-      'Type=CUSTOM_JAR,Name=yarn-settings,ActionOnFailure=CONTINUE,Jar=command-runner.jar,Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_spark_settings.py - | python3 -"]'
+      'Type=CUSTOM_JAR,Name=yarn-resource-config,ActionOnFailure=CONTINUE,Jar=command-runner.jar,Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_resource_config.py - | python3 -"]'
 """  # noqa: E501 - the EMR step command above must stay on one line to copy and paste it
 
 import argparse

@@ -27,7 +27,7 @@ jobs:
       - name: ty (type check)
         run: ty check
       - name: still runs on Python 3.6
-        run: vermin --no-tips --violations -t=3.6- yarn_spark_settings.py tests
+        run: vermin --no-tips --violations -t=3.6- yarn_resource_config.py tests
 
   test:
     # 3.6 and 3.8 (old EMR images) run in containers; 3.12 runs on the runner as a normal user, so the
