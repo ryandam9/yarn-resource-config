@@ -6,6 +6,7 @@ Only the standard library, so it runs on every Python the script supports (3.6 a
 """
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -121,6 +122,23 @@ class Report(unittest.TestCase):
         # waiting or another account does not help a job that never fits
         never = out[out.index("NO: it can NEVER start.") :]
         self.assertNotIn("Wait until one of this user's apps ends.", never[: never.index("\n\n\n")])
+
+    def test_service_accounts(self) -> None:
+        # Spark jobs run as service accounts, mapped to queues with queue-mappings: the report names them
+        # and never says "user", apart from YARN's own property names and messages.
+        rc, out = run("default", self.servers["ok"], ["--details", "--color", "never"])
+        self.check(rc, out)
+        self.assertIn("QUEUE root.default  \u00b7  service account svc_spark\n", out)
+        self.assertIn("QUEUE root.default  \u00b7  service account svc_reports (no jobs now)", out)  # mapped only
+        self.assertIn("Service accounts mapped here", out)
+        self.assertIn("svc_spark, svc_reports", out)  # u:%user:%user names no account
+        allowed = re.compile(
+            r"user-limit-factor|minimum-user-limit-percent|userAMResourceLimit|user\.max-parallel-apps|"
+            r"%user|YARN calls (it|a service account) a user|User's AM resource limit|User AM Resource"
+        )
+        text = allowed.sub("", re.sub(r"\s+", " ", out.replace(os.path.dirname(HERE), "")))  # wrapped lines joined
+        found = re.search(r".{0,60}\b[Uu]ser(s|'s)?\b.{0,60}", text)
+        self.assertIsNone(found, found and found.group(0))
 
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])

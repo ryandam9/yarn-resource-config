@@ -13,4 +13,5 @@
 <property><name>yarn.scheduler.capacity.root.analytics.adhoc.capacity</name><value>50</value></property>
 <property><name>yarn.scheduler.capacity.root.analytics.reports.capacity</name><value>50</value></property>
 <property><name>yarn.scheduler.capacity.root.analytics.reports.ordering-policy</name><value>fair</value></property>
+<property><name>yarn.scheduler.capacity.queue-mappings</name><value>u:svc_spark:default,u:svc_etl:etl,u:svc_load:root.etl,g:analysts:analytics</value></property>
 </configuration>

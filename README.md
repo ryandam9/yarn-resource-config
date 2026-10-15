@@ -1,8 +1,8 @@
 # yarn_resource_config.py
 
 Reports, in plain words, why a Spark app on YARN may get no resources: containers too big for
-YARN or for the nodes, a full ApplicationMaster pool, Oozie launchers that block Spark jobs, user
-limits in a queue, or nodes without room. It reads the YARN, Capacity Scheduler, Spark and Oozie
+YARN or for the nodes, a full ApplicationMaster pool, Oozie launchers that block Spark jobs, the
+limits of each service account in a queue, or nodes without room. It reads the YARN, Capacity Scheduler, Spark and Oozie
 config files and, on Amazon EMR, the live state of the ResourceManager.
 
 The report answers first. The findings say what is wrong (or fine), what happens because of it,
@@ -14,6 +14,16 @@ behind the findings, and a short list of the terms used.
 It is one file, `yarn_resource_config.py`, with no dependencies. (Up to v1.0.0 it was called `yarn_spark_settings.py`.)
 
 Background: [Why your Spark app gets no YARN resources](https://github.com/ryandam9/Guides-2/blob/master/docs/yarn_resources_explained_by_claude.html).
+
+## Service accounts
+
+Spark jobs run as service accounts, and `yarn.scheduler.capacity.queue-mappings` sends each
+service account to its queue (`u:<account>:<queue>`); a queue can have several. YARN keeps its
+limits per service account (YARN calls it a *user*: `user-limit-factor`, `userAMResourceLimit`),
+so all jobs of one service account share them. The report names the service accounts: one card and
+one row in **Queues now** for each service account of a queue, those with jobs in it now first,
+then those mapped to it that have no jobs now. The Settings list the accounts mapped to each queue.
+Mappings by group (`g:`) or with `%user` name no account, so they are not shown.
 
 ## The script is read-only
 
@@ -33,7 +43,7 @@ Background: [Why your Spark app gets no YARN resources](https://github.com/ryand
 |------|---------|
 | Python 3.6 or later | Only the standard library. The script stops with a message on older versions. EMR 6 has Python 3.7 and EMR 7 has Python 3.9. |
 | The cluster's config files | `/etc/hadoop/conf` (`yarn-site.xml`, `capacity-scheduler.xml`), `/etc/spark/conf/spark-defaults.conf`, `/etc/oozie/conf/oozie-site.xml`. A missing file is reported and skipped. |
-| Read access to those files | Most are readable by any user on EMR. Some, such as `oozie-site.xml` or `/mnt/var/lib/info`, can be readable only by their service user. The script then lists them under **COULD NOT READ** and continues. Run it as the `hadoop` user (or with `sudo`) to include them. |
+| Read access to those files | Most are readable by any account on EMR. Some, such as `oozie-site.xml` or `/mnt/var/lib/info`, can be readable only by their own account (such as `oozie`). The script then lists them under **COULD NOT READ** and continues. Run it as the `hadoop` user (or with `sudo`) to include them. |
 | For live data: access to the ResourceManager | Port 8088 (8090 with `yarn.http.policy=HTTPS_ONLY`) on the primary node. The script does not use an HTTP proxy for these requests. |
 | For live data on a Kerberos cluster | Run `kinit` first, and have `curl` installed. If the plain request fails, the script retries with `curl --negotiate`. |
 
@@ -181,12 +191,12 @@ On a terminal the report uses colour so that the parts are easy to tell apart:
 | Could not read | Only when something failed: each config file that could not be read and each ResourceManager address that did not answer, with the reason and what to do. The rest of the report then leaves out what depends on it. |
 | Findings | `[PROBLEM]` (apps fail or wait now), `[WARNING]` (apps can wait or block), `[NOTE]` (good to know), `[OK]`. Each has an explanation with the numbers (in GB) and a "What to do" line. |
 | Can a new job start? | Live only. A **queue card** (see below) for each queue that matters: Spark's queue (`spark.yarn.queue`), the Oozie launcher queue and queues with jobs waiting. With `--queue`, the cards of the queues you name. |
-| Apps | Live only: the apps that run or wait now, grouped by queue and user. Per user: running and waiting apps, the share of the cluster they use against the one-user limit, and their ApplicationMaster memory against the user's AM limit. Per app: ID, name, state, run time, containers, memory, vcores and what it does now (for Spark, the active stage and its finished/total tasks; for waiting apps, YARN's reason). For each running app that asks for more containers than YARN gives, or that has waiting tasks but asks for nothing, it says why in short ✓/✗ bullets (what it asks for, the limit that stops it, the fix): a container bigger than any node, the user limit (all apps of one account share it), the queue maximum, older apps first in a FIFO queue, memory spread over nodes, a full cluster, or Spark's own `maxExecutors` / `spark.executor.instances`. YARN counts limits per user, so all apps of one service account share one user limit. If YARN ACLs hide apps from the user who runs the script, the section says so. |
+| Apps | Live only: the apps that run or wait now, grouped by queue and service account. Per service account: running and waiting apps, the share of the cluster they use against its limit, and their ApplicationMaster memory against its AM limit. Per app: ID, name, state, run time, containers, memory, vcores and what it does now (for Spark, the active stage and its finished/total tasks; for waiting apps, YARN's reason). For each running app that asks for more containers than YARN gives, or that has waiting tasks but asks for nothing, it says why in short ✓/✗ bullets (what it asks for, the limit that stops it, the fix): a container bigger than any node, the limit of the service account (all its apps share it), the queue maximum, older apps first in a FIFO queue, memory spread over nodes, a full cluster, or Spark's own `maxExecutors` / `spark.executor.instances`. YARN counts its limits per service account, so all apps of one service account share them. If YARN ACLs hide apps from the account that runs the script, the section says so. |
 | What one Spark app asks YARN for | Executor and ApplicationMaster containers: heap, overhead, other memory, the size YARN gives, vcores, and the number of executors. |
-| Queues | The queue tree, one frame per parent queue: each frame holds the children of one parent, with their share of that parent ("Of parent") and, under the frame, the sum of those shares (green with ✓ when it is 100%, red when not). Frames next to each other have different colours. For each leaf queue: guaranteed and maximum share of the cluster, the most one user can use, the AM pool use, used memory, running and waiting apps. Marks the queue that Spark and the Oozie launchers use. Below the table, "What the columns mean" explains each column in plain words, and an example reads the numbers of Spark's queue: what it always gets, how far it can grow, what one user can use and how many more apps can start. |
-| Queues now | Live only. One line per queue, for its main user (the one that uses the most, or a new user): the AM limit that is free, how many new jobs that is (Oozie jobs where the launchers run, launcher + Spark AM; else spark-submit jobs), the memory that is free, and whether a new job can start now (if not, the first reason). Each job sets its own executors, so it does not count them. With `--details`, a balance sheet for each queue that matters follows (see below). |
+| Queues | The queue tree, one frame per parent queue: each frame holds the children of one parent, with their share of that parent ("Of parent") and, under the frame, the sum of those shares (green with ✓ when it is 100%, red when not). Frames next to each other have different colours. For each leaf queue: guaranteed and maximum share of the cluster, the most one service account can use ("Per account"), the AM pool use, used memory, running and waiting apps. Marks the queue that Spark and the Oozie launchers use. Below the table, "What the columns mean" explains each column in plain words, and an example reads the numbers of Spark's queue: what it always gets, how far it can grow, what one service account can use and how many more apps can start. |
+| Queues now | Live only. One row per service account of each queue (with jobs there now, or mapped to it): the AM limit that is free for it, how many new jobs that is (Oozie jobs where the launchers run, launcher + Spark AM; else spark-submit jobs), the memory that is free for it, and whether a new job can start now (if not, the first reason). Each job sets its own executors, so it does not count them. With `--details`, a balance sheet for each queue that matters follows (see below). |
 | Nodes | Live only: memory and vcores of each node, used and free, containers and state. |
-| Settings | The settings behind the findings, with a plain label, the value (or the default used) and the property name. Under `capacity-scheduler.xml` it also lists the settings of each queue, such as `yarn.scheduler.capacity.root.<queue>.user-limit-factor`; see the example below. |
+| Settings | The settings behind the findings, with a plain label, the value (or the default used) and the property name. Under `capacity-scheduler.xml` it also lists the settings of each queue, such as `yarn.scheduler.capacity.root.<queue>.user-limit-factor`, and the service accounts mapped to it (`queue-mappings`); see the example below. |
 | Terms | Container, ApplicationMaster, AM pool, overhead and the other terms used in the report. |
 
 The checks:
@@ -198,12 +208,12 @@ The checks:
   are not usable.
 - **AM limits of Spark's queue**: when the Oozie launchers run there, one job is an Oozie job
   (launcher + Spark AM), as on the queue card. A PROBLEM when one such job needs more than the
-  whole AM limit of one user (it can never start), or when jobs wait now because an AM limit is
-  full; otherwise how many new jobs the AM limits allow per user. The fixes come with values worked
+  whole AM limit of one service account (it can never start), or when jobs wait now because an AM
+  limit is full; otherwise how many new jobs the AM limits allow per service account (named). The fixes come with values worked
   out from the numbers: `user-limit-factor`, `maximum-am-resource-percent`, or less memory for the
   launchers (`oozie.launcher.default.memory.mb`).
-- **User limit**: queues where one user cannot use the part of the queue that other queues leave
-  idle, with the `user-limit-factor` that fixes it.
+- **Limit per service account**: queues where one service account cannot use the part of the queue
+  that other queues leave idle, with the `user-limit-factor` that fixes it.
 - **Spark's own limits** (`maxExecutors`, `spark.executor.instances`), a missing or stopped queue,
   and apps that wait in any queue (with the likely reason).
 
@@ -224,19 +234,20 @@ three queues:
 
 ```text
   Queue root.etl
-  Guaranteed share of the parent          yarn.scheduler.capacity.root.etl.capacity                                   40%
-  Most share of the parent                yarn.scheduler.capacity.root.etl.maximum-capacity                           80%
-  State                                   yarn.scheduler.capacity.root.etl.state                                      RUNNING (default)
-  One user: x guaranteed share            yarn.scheduler.capacity.root.etl.user-limit-factor                          2
-  Smallest share per active user          yarn.scheduler.capacity.root.etl.minimum-user-limit-percent                 100% (default)
-  AM pool share                           yarn.scheduler.capacity.root.etl.maximum-am-resource-percent                0.3
-  Largest container: memory               yarn.scheduler.capacity.root.etl.maximum-allocation-mb                      cluster limit (default)
-  Most running apps                       yarn.scheduler.capacity.root.etl.max-parallel-apps                          no limit (default)
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.etl.capacity                                   40%
+  Most share of the parent                   yarn.scheduler.capacity.root.etl.maximum-capacity                           80%
+  State                                      yarn.scheduler.capacity.root.etl.state                                      RUNNING (default)
+  One service account: x guaranteed share    yarn.scheduler.capacity.root.etl.user-limit-factor                          2
+  Smallest share per active service account  yarn.scheduler.capacity.root.etl.minimum-user-limit-percent                 100% (default)
+  AM pool share                              yarn.scheduler.capacity.root.etl.maximum-am-resource-percent                0.3
+  Largest container: memory                  yarn.scheduler.capacity.root.etl.maximum-allocation-mb                      cluster limit (default)
+  Most running apps                          yarn.scheduler.capacity.root.etl.max-parallel-apps                          no limit (default)
+  Service accounts mapped here               yarn.scheduler.capacity.queue-mappings                                      svc_etl, svc_load
 
   Queue root.analytics  (parent queue: its children share it)
-  Guaranteed share of the parent          yarn.scheduler.capacity.root.analytics.capacity                             20%
-  Most share of the parent                yarn.scheduler.capacity.root.analytics.maximum-capacity                     100% (default)
-  State                                   yarn.scheduler.capacity.root.analytics.state                                RUNNING (default)
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.analytics.capacity                             20%
+  Most share of the parent                   yarn.scheduler.capacity.root.analytics.maximum-capacity                     100% (default)
+  State                                      yarn.scheduler.capacity.root.analytics.state                                RUNNING (default)
 ```
 
 Other queue properties, such as `acl_submit_applications` or `ordering-policy`, are listed with
@@ -249,24 +260,24 @@ three levels and one mistake (in colour, each frame has its own colour and the s
 red):
 
 ```
-    Queue                          Of parent  Guaranteed  Max   One user  AM pool used  Used  Run  Wait
-  ┌─ children of root ─────────────────────────────────────────────────────────────────────────────────
-  │ root.default (Spark, Oozie)    40%        40%         80%   80%       20%-40%       -     -    -
-  │ root.etl (parent)              40%        40%         80%   -         -             -     -    -
-  │ root.analytics (parent)        20%        20%         100%  -         -             -     -    -
+    Queue                          Of parent  Guaranteed  Max   Per account  AM pool used  Used  Run  Wait
+  ┌─ children of root ────────────────────────────────────────────────────────────────────────────────────
+  │ root.default (Spark, Oozie)    40%        40%         80%   80%          20%-40%       -     -    -
+  │ root.etl (parent)              40%        40%         80%   -            -             -     -    -
+  │ root.analytics (parent)        20%        20%         100%  -            -             -     -    -
   └─ 40% + 40% + 20% = 100% of root ✓
-  ┌─ children of root.etl ─────────────────────────────────────────────────────────────────────────────
-  │ root.etl.daily                 2w (67%)   27%         80%   27%       13%-40%       -     -    -
-  │ root.etl.hourly                1w (33%)   13%         80%   13%       7%-40%        -     -    -
+  ┌─ children of root.etl ────────────────────────────────────────────────────────────────────────────────
+  │ root.etl.daily                 2w (67%)   27%         80%   27%          13%-40%       -     -    -
+  │ root.etl.hourly                1w (33%)   13%         80%   13%          7%-40%        -     -    -
   └─ weights 2w + 1w: each queue gets its weight / 3 of root.etl
-  ┌─ children of root.analytics ───────────────────────────────────────────────────────────────────────
-  │ root.analytics.adhoc (parent)  50%        10%         100%  -         -             -     -    -
-  │ root.analytics.reports         50%        10%         100%  10%       5%-50%        -     -    -
+  ┌─ children of root.analytics ──────────────────────────────────────────────────────────────────────────
+  │ root.analytics.adhoc (parent)  50%        10%         100%  -            -             -     -    -
+  │ root.analytics.reports         50%        10%         100%  10%          5%-50%        -     -    -
   └─ 50% + 50% = 100% of root.analytics ✓
-  ┌─ children of root.analytics.adhoc ─────────────────────────────────────────────────────────────────
-  │ root.analytics.adhoc.team_a    50%        5%          100%  5%        2%-50%        -     -    -
-  │ root.analytics.adhoc.team_b    30%        3%          100%  3%        2%-50%        -     -    -
-  │ root.analytics.adhoc.team_c    10%        1%          100%  1%        0%-50%        -     -    -
+  ┌─ children of root.analytics.adhoc ────────────────────────────────────────────────────────────────────
+  │ root.analytics.adhoc.team_a    50%        5%          100%  5%           2%-50%        -     -    -
+  │ root.analytics.adhoc.team_b    30%        3%          100%  3%           2%-50%        -     -    -
+  │ root.analytics.adhoc.team_c    10%        1%          100%  1%           0%-50%        -     -    -
   └─ 50% + 30% + 10% = 90% of root.analytics.adhoc, not 100%: check the capacities of these queues
 ```
 
@@ -289,28 +300,29 @@ job from Oozie as the normal case: its launcher is an ApplicationMaster (AM) too
 needs the launcher (`oozie.launcher.default.memory.mb`) plus the Spark AM from the AM limits.
 
 - **The answer:** ✗ a new job would wait (or can never start, when one Oozie job needs more than
-  the whole AM limit of the user), ! it would start but no memory is left for executors, or ✓ it
+  the whole AM limit of the service account), ! it would start but no memory is left for executors, or ✓ it
   can start, with the memory left for its executors.
-- **1. AM limit of the user** and **2. AM limit of the whole queue**, in aligned columns of
+- **1. AM limit of the service account** and **2. AM limit of the whole queue**, in aligned columns of
   *what*, *the formula with property names and live values*, and *the result*: the launcher and
   Spark AM sizes, each factor of the limit, the limit by the formula and YARN's own figure (the one
   that counts), the AM memory in use, what is free, and how many new Oozie jobs and new
   spark-submit jobs fit.
-- **3. Memory available to the user:** the queue max, what the queue uses and what is free; the
-  user's share, what the user uses and what is free; what is free in the cluster; the smallest of
+- **3. Memory available to the service account:** the queue max, what the queue uses and what is
+  free; the service account's share, what it uses and what is free; what is free in the cluster; the smallest of
   these; what is left for executors after a new job's AMs; and the largest free space on one node.
 - **Notes** and **What you can do**, with the setting and a value worked out from the numbers:
   raise `user-limit-factor` or `maximum-am-resource-percent`, or give the launchers less memory.
 
 The card does not count executors: each job sets its own executor number and size. There is one
-card for each user with jobs in the queue (or one for a new user). The balance sheets with every
+card for each service account of the queue: those with jobs in it now, then those mapped to it
+(`queue-mappings`) that have no jobs now. The balance sheets with every
 number are there with `--details`.
 
 Example (test data; on a test cluster YARN's figures need not match the formulas):
 
 ```
-QUEUE root.default  ·  user svc_spark
-─────────────────────────────────────
+QUEUE root.default  ·  service account svc_spark
+────────────────────────────────────────────────
 
   ✓ A new Spark job from Oozie can START now.
     • Memory left for its executors: 7.92 GB (available 10.80 GB, minus 2.88 GB for the launcher and
@@ -323,9 +335,9 @@ QUEUE root.default  ·  user svc_spark
       One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   16.80 GB
       AM percent                maximum-am-resource-percent                             =        50%
-      User limit factor         user-limit-factor                                       =          1
-      User share                the larger of minimum-user-limit-percent 100% and 1 / 1 =       100%
-                                active user
+      Limit factor              user-limit-factor                                       =          1
+      Share per account         the larger of minimum-user-limit-percent 100% and 1 / 1 =       100%
+                                active service account
       Limit by the formula      16.80 GB × 50% × 1 × 100%                               =    8.40 GB
       Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    6.00 GB
                                 counts
@@ -367,13 +379,14 @@ QUEUE root.default  ·  user svc_spark
       memory for executors (its share 16.80 GB, split 2 ways, minus the AMs).
 
   All numbers in detail (the balance sheet): run again with --details.
+  Only memory counts here: the resource calculator ignores vcores.
 ```
 
-Example: one Oozie job needs more than the user's whole AM limit:
+Example: one Oozie job needs more than the service account's whole AM limit:
 
 ```
-QUEUE root.default  ·  user svc_spark
-─────────────────────────────────────
+QUEUE root.default  ·  service account svc_spark
+────────────────────────────────────────────────
 
   ✗ A new Spark job from Oozie can NEVER start here now.
     • Why: svc_spark's AM limit is 2.62 GB in all, and a new Oozie job needs 2.88 GB (launcher 2.00
@@ -386,9 +399,9 @@ QUEUE root.default  ·  user svc_spark
       One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
       AM percent                maximum-am-resource-percent                             =        50%
-      User limit factor         user-limit-factor                                       =          1
-      User share                the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
-                                active users
+      Limit factor              user-limit-factor                                       =          1
+      Share per account         the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
+                                active service accounts
       Limit by the formula      24.00 GB × 50% × 1 × 100% (at most the queue's AM       =   12.00 GB
                                 limit)
       Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    2.62 GB
@@ -428,14 +441,14 @@ QUEUE root.default  ·  user svc_spark
       Largest free on one node    a container (AM or executor) must fit on one node     =    1.87 GB
 
   What you can do
-    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 2.1: svc_spark's AM limit
-       becomes about 5.51 GB, room for 1 more Oozie job. It also raises svc_spark's share of the
-       queue.
-    2. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (in
-       oozie-site.xml, or oozie.launcher.memory.mb in one workflow action). A launcher only waits
-       for its Spark job, so it rarely needs 2 GB.
+    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: each service account's
+       AM limit becomes about 2.89 GB (it also raises each service account's share of the queue).
+    2. Or raise yarn.scheduler.capacity.root.default.maximum-am-resource-percent 0.5 -> 0.55.
+    3. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (or
+       oozie.launcher.memory.mb in one workflow action); a launcher only waits for its Spark job.
 
   All numbers in detail (the balance sheet): run again with --details.
+  Only memory counts here: the resource calculator ignores vcores.
 ```
 
 ### Queues now and the balance sheets (`--details`)
@@ -443,10 +456,12 @@ QUEUE root.default  ·  user svc_spark
 With live data, the **Queues now** table gives one line per queue:
 
 ```
-  Queue                     Main user   AM free  New jobs  Memory free  A new job now
-  root.analytics.adhoc      a new user  -        -         3.12 GB      ✓ can start
-  root.analytics.team.only  a new user  -        -         2.88 GB      ✓ can start
-  root.default              svc_spark   0.00 GB  0 Oozie   0.00 GB      ✗ never (Oozie job > user's AM limit)
+  Queue                     Service account  AM free  New jobs  Memory free  A new job now
+  root.analytics.adhoc      none mapped      -        -         3.12 GB      ✓ can start
+  root.analytics.team.only  none mapped      -        -         2.88 GB      ✓ can start
+  root.default              svc_spark        0.00 GB  0 Oozie   0.00 GB      ✗ never (Oozie job > its AM limit)
+                            hadoop           0.62 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > its AM limit)
+                            svc_reports      2.62 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > its AM limit)
 ```
 
 With `--details`, each queue that matters (or each queue named with `--queue`) also gets a balance
@@ -457,27 +472,28 @@ queue may use, then subtracts what is used, then shows the result:
   queues under a parent share its maximum), and the free memory of the cluster. The room is the
   smallest of these, and the line names which one sets it.
 - **AM pool:** the pool minus the AMs of the running apps, and how many more Spark AMs fit.
-- **Users:** each user's limit, use and AM use. YARN counts these per user, so all apps of one
-  service account share them.
+- **Service accounts:** each service account's limit, use and AM use. YARN counts these per service
+  account, so all its apps share them.
 - **Can a new Spark app start here now?** Each check that YARN makes before an app starts, ✓ or
   ✗, then YES or NO. Each job sets its own executors, so YES only says that it starts. It is done
-  per user twice:
+  per service account (those with jobs, then those mapped to the queue) twice:
   - **with spark-submit:** one Spark AM.
   - **from an Oozie workflow:** first the Oozie launcher (`oozie.launcher.default.memory.mb`,
     in `oozie.launcher.default.queue`), which stays until the Spark job ends, then the Spark AM.
-    The launcher's memory is taken off the AM pool, the user's AM limit, the user limit and the
+    The launcher's memory is taken off the AM pool, the service account's AM limit, its limit and the
     room (of its queue, its parents and the cluster) before the Spark AM is checked. The verdict
-    says which step fails. If the two together never fit in one user's AM limit, it says so and
+    says which step fails. If the two together never fit in one service account's AM limit, it says so and
     how to fix it.
 
   Running launchers need no special handling: they are YARN apps, so the used memory, AM memory
-  and user numbers from the ResourceManager already include them.
+  and service account numbers from the ResourceManager already include them.
 
   When the answer is ✗ NO (or ✓ YES, but no executor fits), a **Why** block explains the limit
   that stops the app, as short lists rather than paragraphs, for a reader who does not know
   YARN's rules:
-  - **Why:** which limit it is: a stopped queue, the queue's AM pool, the user's AM limit, the
-    queue or a parent queue at its maximum, a full cluster, no node with room, or the user limit.
+  - **Why:** which limit it is: a stopped queue, the queue's AM pool, the service account's AM limit,
+    the queue or a parent queue at its maximum, a full cluster, no node with room, or the service
+    account's limit.
   - **What this limit is:** one bullet per fact.
   - **The numbers:** how the limit is worked out and what uses it now, one bullet each; the line
     that is not enough has a ✗.
@@ -490,23 +506,23 @@ queue may use, then subtracts what is used, then shows the result:
 Example: a spark-submit that waits because the service account's AM limit is full:
 
 ```
-      As user svc_spark, with spark-submit:
+      As service account svc_spark, with spark-submit:
         ✓ Spark AM: queue root.default is RUNNING
         ✓ Spark AM: AM pool of root.default: 7.38 GB free, needs 0.88 GB
-        ✗ Spark AM: AM limit of user svc_spark: 0.00 GB free, needs 0.88 GB
+        ✗ Spark AM: AM limit of service account svc_spark: 0.00 GB free, needs 0.88 GB
         ✓ Spark AM: room for queue root.default now: 3.12 GB, needs 0.88 GB
         ✓ Spark AM: the most free on one node: 1.87 GB (a container must fit on one node)
-        ✓ Spark AM: user limit of svc_spark in root.default: 5.12 GB left (limit 24.00 GB, uses 18.88 GB)
+        ✓ Spark AM: limit of svc_spark in root.default: 5.12 GB left (limit 24.00 GB, uses 18.88 GB)
         ✗ NO: it waits in ACCEPTED.
           • ACCEPTED means: YARN has the app, but does not start it yet.
-        Why: User svc_spark has reached its AM limit in queue root.default
+        Why: Service account svc_spark has reached its AM limit in queue root.default
           What this limit is:
-            • YARN limits the AMs of each user, not only of the whole queue.
-            • All apps of one account share this limit.
+            • YARN limits the AMs of each service account, not only of the whole queue.
+            • All apps of one service account share this limit.
             • So one service account can block itself, while the AM pool still has room for other
-              users.
+              service accounts.
           The numbers:
-            • User AM limit: 2.62 GB (YARN's figure, userAMResourceLimit)
+            • AM limit per service account: 2.62 GB (YARN's figure, userAMResourceLimit)
             • Worked out by YARN from maximum-am-resource-percent, user-limit-factor and
               minimum-user-limit-percent
             • svc_spark's AMs now: 2.62 GB (3 running apps)
@@ -516,38 +532,40 @@ Example: a spark-submit that waits because the service account's AM limit is ful
             • yarn.scheduler.capacity.root.default.user-limit-factor
             • yarn.scheduler.capacity.root.default.minimum-user-limit-percent
           What you can do:
-            1. Wait until one of this user's apps ends.
+            1. Wait until one of the apps of svc_spark ends.
             2. Or raise user-limit-factor of queue root.default.
             3. Or raise maximum-am-resource-percent of queue root.default.
-            4. Or run some apps under another account: each user has its own AM limit.
+            4. Or run some apps under another service account mapped to this queue: each has its own
+               AM limit.
 ```
 
-Example of the Oozie check, where one Oozie job (launcher + Spark AM) needs more than the user's whole
+Example of the Oozie check, where one Oozie job (launcher + Spark AM) needs more than the service account's whole
 AM limit, so it can never start:
 
 ```
-      As user svc_spark, from an Oozie workflow: first the launcher (2.00 GB, queue root.default),
-      then the Spark AM in the same queue:
+      As service account svc_spark, from an Oozie workflow: first the launcher (2.00 GB, queue
+      root.default), then the Spark AM in the same queue:
         ✓ launcher: queue root.default is RUNNING
         ✓ launcher: AM pool of root.default: 11.12 GB free, needs 2.00 GB
-        ✗ launcher: AM limit of user svc_spark: 1.75 GB free, needs 2.00 GB
+        ✗ launcher: AM limit of service account svc_spark: 1.75 GB free, needs 2.00 GB
         ✓ launcher: room for queue root.default now: 16.00 GB, needs 2.00 GB
         ✓ launcher: the most free on one node: 9.00 GB (a container must fit on one node)
-        ✓ launcher: user limit of svc_spark in root.default: 14.00 GB left (limit 20.00 GB, uses 6.00 GB)
+        ✓ launcher: limit of svc_spark in root.default: 14.00 GB left (limit 20.00 GB, uses 6.00 GB)
         ✗ NO: it can NEVER start.
           • The launcher and the Spark AM together need 2.88 GB.
-          • That is more than the AM limit of one user (2.62 GB), even when nothing else runs.
+          • That is more than the AM limit of one service account (2.62 GB), even when nothing else
+            runs.
           • So the launcher starts, and then waits for good.
           • Fixes: raise user-limit-factor or maximum-am-resource-percent, or give the launchers
             less memory (the queue card at the top has the values).
-        Why: User svc_spark has reached its AM limit in queue root.default
+        Why: Service account svc_spark has reached its AM limit in queue root.default
           What this limit is:
-            • YARN limits the AMs of each user, not only of the whole queue.
-            • All apps of one account share this limit.
+            • YARN limits the AMs of each service account, not only of the whole queue.
+            • All apps of one service account share this limit.
             • So one service account can block itself, while the AM pool still has room for other
-              users.
+              service accounts.
           The numbers:
-            • User AM limit: 2.62 GB (YARN's figure, userAMResourceLimit)
+            • AM limit per service account: 2.62 GB (YARN's figure, userAMResourceLimit)
             • Worked out by YARN from maximum-am-resource-percent, user-limit-factor and
               minimum-user-limit-percent
             • svc_spark's AMs now: 0.88 GB (1 running app)
@@ -588,23 +606,23 @@ Example (live test data, Hadoop 3 with effective resources):
                                                              ───────────
     = Free in the AM pool                                       11.12 GB
       That is room for 12 more Spark AMs of 0.88 GB (one AM per app).
-      Each user may use at most 2.62 GB of the AM pool (userAMResourceLimit).
+      Each service account may use at most 2.62 GB of the AM pool (userAMResourceLimit).
 
-    Users with apps in this queue (the user limit is per user, not per app)
-      User       Run / wait  User limit  Used     Left      AM limit  AM used  AM left
-      svc_spark  1 / 0       20.00 GB    6.00 GB  14.00 GB  2.62 GB   0.88 GB  1.75 GB
-      • User limit: the most one user may use in this queue.
+    Service accounts with apps in this queue (the limit is per service account, not per app)
+      Service account  Run / wait  Limit     Used     Left      AM limit  AM used  AM left
+      svc_spark        1 / 0       20.00 GB  6.00 GB  14.00 GB  2.62 GB   0.88 GB  1.75 GB
+      • Limit: the most one service account may use in this queue.
       • It is user-limit-factor 1 x guaranteed 20.00 GB, at most the queue max.
 
     Can a new Spark app start here now?
 
-      As user svc_spark, with spark-submit:
+      As service account svc_spark, with spark-submit:
         ✓ Spark AM: queue root.default is RUNNING
         ✓ Spark AM: AM pool of root.default: 11.12 GB free, needs 0.88 GB
-        ✓ Spark AM: AM limit of user svc_spark: 1.75 GB free, needs 0.88 GB
+        ✓ Spark AM: AM limit of service account svc_spark: 1.75 GB free, needs 0.88 GB
         ✓ Spark AM: room for queue root.default now: 16.00 GB, needs 0.88 GB
         ✓ Spark AM: the most free on one node: 9.00 GB (a container must fit on one node)
-        ✓ Spark AM: user limit of svc_spark in root.default: 14.00 GB left (limit 20.00 GB, uses 6.00 GB)
+        ✓ Spark AM: limit of svc_spark in root.default: 14.00 GB left (limit 20.00 GB, uses 6.00 GB)
         ✓ YES: it starts now.
 ```
 
@@ -627,7 +645,7 @@ longer fit its AM limit. EMR's own config otherwise.
 ```text
 YARN and Spark resource report
 ==============================
-Created:   2026-10-15 19:31 UTC
+Created:   2026-10-15 20:33 UTC
 Cluster:   j-TEST, emr-7.14.0 (master: 1 x m5.xlarge)
 This host: primary node
 Live data: from the ResourceManager at http://ip-10-0-0-1:8088
@@ -641,27 +659,28 @@ Summary: 2 problems, 2 warnings, 2 OK.
             2.88 GB of AM limit.
           • AM limit of the queue: 12.00 GB (maximum-am-resource-percent 50%): room for 4 Oozie
             jobs.
-          • AM limit of each user: 2.62 GB: room for 0 Oozie jobs per user. All jobs of one account
-            (for example a service account) share it.
-          ✗ 2.88 GB is more than the user's AM limit (2.62 GB), so the job never starts: the
-            launcher starts, and the Spark AM then waits in ACCEPTED for good.
+          • AM limit of each service account (svc_spark, hadoop, svc_reports): 2.62 GB: room for 0
+            Oozie jobs per service account. All jobs of one service account share it.
+          ✗ 2.88 GB is more than each service account's AM limit (2.62 GB), so the job never starts:
+            the launcher starts, and the Spark AM then waits in ACCEPTED for good.
           What to do:
-            1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: the user's AM
-               limit becomes about 2.89 GB (it also raises the user's share of the queue).
+            1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: each service
+               account's AM limit becomes about 2.89 GB (it also raises each service account's share
+               of the queue).
             2. Or raise yarn.scheduler.capacity.root.default.maximum-am-resource-percent 0.5 ->
                0.55.
             3. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (or
                oozie.launcher.memory.mb in one workflow action); a launcher only waits for its Spark
                job.
 
-[PROBLEM] 1 app of user svc_spark waits: the user's AM limit is full
-          YARN gives each user only part of a queue's AM pool, and all apps of one user share it.
-          The running apps of svc_spark in queue root.default hold all of it, so its new apps stay
-          in ACCEPTED, even if the queue has room. A service account that submits many apps meets
-          this limit first.
-          What to do: Raise yarn.scheduler.capacity.root.default.user-limit-factor (the user AM
-          limit grows with it), or run fewer apps at the same time. The card for the queue (near the
-          top) has values.
+[PROBLEM] 1 app of svc_spark waits: its AM limit is full
+          YARN gives each service account only part of a queue's AM pool, and all apps of one
+          service account share it. The running apps of svc_spark in queue root.default hold all of
+          it, so its new apps stay in ACCEPTED, even if the queue has room. A service account that
+          submits many apps meets this limit first.
+          What to do: Raise yarn.scheduler.capacity.root.default.user-limit-factor (each service
+          account's AM limit grows with it), or run fewer apps at the same time. The card for the
+          queue (near the top) has values.
 
 [WARNING] Right now no node has room for an executor of the default size
           The most free memory on one node is 1.87 GB; an executor of the default size
@@ -689,8 +708,8 @@ One card for each queue named with --queue, or else for the queues that matter: 
 (spark.yarn.queue), the Oozie launcher queue and queues with jobs waiting.
 
 
-QUEUE root.default  ·  user svc_spark
-─────────────────────────────────────
+QUEUE root.default  ·  service account svc_spark
+────────────────────────────────────────────────
 
   ✗ A new Spark job from Oozie can NEVER start here now.
     • Why: svc_spark's AM limit is 2.62 GB in all, and a new Oozie job needs 2.88 GB (launcher 2.00
@@ -703,9 +722,9 @@ QUEUE root.default  ·  user svc_spark
       One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
       AM percent                maximum-am-resource-percent                             =        50%
-      User limit factor         user-limit-factor                                       =          1
-      User share                the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
-                                active users
+      Limit factor              user-limit-factor                                       =          1
+      Share per account         the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
+                                active service accounts
       Limit by the formula      24.00 GB × 50% × 1 × 100% (at most the queue's AM       =   12.00 GB
                                 limit)
       Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    2.62 GB
@@ -745,8 +764,8 @@ QUEUE root.default  ·  user svc_spark
       Largest free on one node    a container (AM or executor) must fit on one node     =    1.87 GB
 
   What you can do
-    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: the user's AM limit
-       becomes about 2.89 GB (it also raises the user's share of the queue).
+    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: each service account's
+       AM limit becomes about 2.89 GB (it also raises each service account's share of the queue).
     2. Or raise yarn.scheduler.capacity.root.default.maximum-am-resource-percent 0.5 -> 0.55.
     3. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (or
        oozie.launcher.memory.mb in one workflow action); a launcher only waits for its Spark job.
@@ -754,8 +773,8 @@ QUEUE root.default  ·  user svc_spark
   All numbers in detail (the balance sheet): run again with --details.
   Only memory counts here: the resource calculator ignores vcores.
 
-QUEUE root.default  ·  user hadoop
-──────────────────────────────────
+QUEUE root.default  ·  service account hadoop
+─────────────────────────────────────────────
 
   ✗ A new Spark job from Oozie can NEVER start here now.
     • Why: hadoop's AM limit is 2.62 GB in all, and a new Oozie job needs 2.88 GB (launcher 2.00 GB
@@ -768,9 +787,9 @@ QUEUE root.default  ·  user hadoop
       One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
       AM percent                maximum-am-resource-percent                             =        50%
-      User limit factor         user-limit-factor                                       =          1
-      User share                the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
-                                active users
+      Limit factor              user-limit-factor                                       =          1
+      Share per account         the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
+                                active service accounts
       Limit by the formula      24.00 GB × 50% × 1 × 100% (at most the queue's AM       =   12.00 GB
                                 limit)
       Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    2.62 GB
@@ -810,8 +829,72 @@ QUEUE root.default  ·  user hadoop
       Largest free on one node  a container (AM or executor) must fit on one node       =    1.87 GB
 
   What you can do
-    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: the user's AM limit
-       becomes about 2.89 GB (it also raises the user's share of the queue).
+    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: each service account's
+       AM limit becomes about 2.89 GB (it also raises each service account's share of the queue).
+    2. Or raise yarn.scheduler.capacity.root.default.maximum-am-resource-percent 0.5 -> 0.55.
+    3. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (or
+       oozie.launcher.memory.mb in one workflow action); a launcher only waits for its Spark job.
+
+  All numbers in detail (the balance sheet): run again with --details.
+  Only memory counts here: the resource calculator ignores vcores.
+
+QUEUE root.default  ·  service account svc_reports (no jobs now)
+────────────────────────────────────────────────────────────────
+
+  ✗ A new Spark job from Oozie can NEVER start here now.
+    • Why: svc_reports's AM limit is 2.62 GB in all, and a new Oozie job needs 2.88 GB (launcher
+      2.00 GB + Spark AM 0.88 GB).
+    • The launcher starts, and the Spark AM then waits for good. See What you can do.
+
+  1. AM limit of svc_reports   ✗ NEVER fits an Oozie job: the whole limit is 2.62 GB
+      Oozie launcher (an AM)    oozie.launcher.default.memory.mb                        =    2.00 GB
+      Spark AM                  spark.yarn.am.memory 512 MB + overhead 384 MB           =    0.88 GB
+      One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
+      Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
+      AM percent                maximum-am-resource-percent                             =        50%
+      Limit factor              user-limit-factor                                       =          1
+      Share per account         the larger of minimum-user-limit-percent 100% and 1 / 2 =       100%
+                                active service accounts
+      Limit by the formula      24.00 GB × 50% × 1 × 100% (at most the queue's AM       =   12.00 GB
+                                limit)
+      Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    2.62 GB
+                                counts
+      Used                      svc_reports has no running apps                         =    0.00 GB
+    ✗ Free                      2.62 GB - 0.00 GB                                       =    2.62 GB
+    ✗ New Oozie jobs that fit   2.62 GB / 2.88 GB (launcher + Spark AM)                 =          0
+    ✓ New spark-submit jobs     2.62 GB / 0.88 GB (Spark AM only)                       =          3
+
+  2. AM limit of the whole queue   ✓ room for 2 new Oozie jobs
+      AM percent                maximum-am-resource-percent                             =        50%
+      Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
+      Limit by the formula      50% × 24.00 GB (YARN may use more when the queue uses   =   12.00 GB
+                                more, up to its max)
+      Limit (YARN's figure)     AMResourceLimit, from the ResourceManager: this one     =   12.00 GB
+                                counts
+      Used                      4 running AMs (svc_spark 2.62 GB, hadoop 2.00 GB)       =    4.62 GB
+    ✓ Free                      12.00 GB - 4.62 GB                                      =    7.38 GB
+    ✓ New Oozie jobs that fit   7.38 GB / 2.88 GB (launcher + Spark AM)                 =          2
+    ✓ New spark-submit jobs     7.38 GB / 0.88 GB (Spark AM only)                       =          8
+      • svc_reports cannot use this room: its own AM limit (block 1) is the one that is short.
+
+  3. Memory available to svc_reports   ✓ 3.12 GB free now
+      Queue max                     maximum-capacity 100% × cluster 24.00 GB            =   24.00 GB
+      Used by the queue             all running containers in root.default              =   20.88 GB
+    ✓ Free in the queue             24.00 GB - 20.88 GB                                 =    3.12 GB
+      svc_reports's share           user-limit-factor 1 × guaranteed 24.00 GB, at most  =   24.00 GB
+                                    the queue max
+      Used by svc_reports           no running apps                                     =    0.00 GB
+    ✓ Free in svc_reports's share   24.00 GB - 0.00 GB                                  =   24.00 GB
+    ✓ Free in the cluster           memory that no container uses (of 24.00 GB)         =    3.12 GB
+    ✓ Available to svc_reports now  the smallest of the free amounts above (free in the =    3.12 GB
+                                    queue)
+    ✓ Left for executors            3.12 GB - 2.88 GB (launcher + Spark AM of a new     =    0.25 GB
+                                    Oozie job)
+      Largest free on one node      a container (AM or executor) must fit on one node   =    1.87 GB
+
+  What you can do
+    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.1: each service account's
+       AM limit becomes about 2.89 GB (it also raises each service account's share of the queue).
     2. Or raise yarn.scheduler.capacity.root.default.maximum-am-resource-percent 0.5 -> 0.55.
     3. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (or
        oozie.launcher.memory.mb in one workflow action); a launcher only waits for its Spark job.
@@ -821,19 +904,19 @@ QUEUE root.default  ·  user hadoop
 
 APPS
 ----
-The apps that run or wait in YARN now, grouped by queue and user. YARN counts the user limit per
-user, not per app: all apps of one account (for example a service account) share one user limit.
+The apps that run or wait in YARN now, grouped by queue and service account. YARN counts its limits
+per service account (YARN calls it a user), not per app: all apps of one service account share them.
 
-  Queue root.default · user svc_spark: 3 running, 1 waiting · uses 79% of the cluster (one-user
-    limit 100%) · AM 2.62 GB of 2.62 GB
+  Queue root.default · service account svc_spark: 3 running, 1 waiting · uses 79% of the cluster
+    (limit per account 100%) · AM 2.62 GB of 2.62 GB
     App                             Name            State     Time    Cont  Memory    vcores  Doing now
     application_1760400000000_0012  daily_payments  RUNNING   14m02s  3     12.00 GB  9       stage 3 groupBy at report.py:42: 412/800 tasks · wants 3 more containers
     application_1760400000000_0013  merchant_sync   RUNNING   6m40s   2     6.00 GB   5       stage 2 count at sync.py:20: 0/8 tasks
     application_1760400000000_0014  recon_report    RUNNING   1m12s   1     0.88 GB   1       35% done (YARN progress)
-    application_1760400000000_0015  audit_export    ACCEPTED  4m30s   -     -         -       waiting: user's AM limit is full
+    application_1760400000000_0015  audit_export    ACCEPTED  4m30s   -     -         -       waiting: its service account's AM limit is full
 
-  Queue root.default · user hadoop: 1 running, 0 waiting · uses 8% of the cluster (one-user limit
-    100%) · AM 2.00 GB of 2.62 GB
+  Queue root.default · service account hadoop: 1 running, 0 waiting · uses 8% of the cluster (limit
+    per account 100%) · AM 2.00 GB of 2.62 GB
     App                             Name                          State    Time    Cont  Memory   vcores  Doing now
     application_1760400000000_0011  oozie:launcher:T=spark:W=ni~  RUNNING  15m00s  1     2.00 GB  1       Oozie launcher: waits for its child job
 
@@ -880,64 +963,69 @@ QUEUES
 How YARN shares the cluster between the queues. Each frame holds the children of one parent queue;
 their shares of the parent must add up to 100%. The columns are explained below the table.
 
-    Queue                        Of parent  Guaranteed  Max   One user  AM pool used         Used      Run  Wait
-  ┌─ children of root ──────────────────────────────────────────────────────────────────────────────────────────
-  │ root.default (Spark, Oozie)  100%       100%        100%  100%      4.62 GB of 12.00 GB  20.88 GB  4    1
+    Queue                        Of parent  Guaranteed  Max   Per account  AM pool used         Used      Run  Wait
+  ┌─ children of root ─────────────────────────────────────────────────────────────────────────────────────────────
+  │ root.default (Spark, Oozie)  100%       100%        100%  100%         4.62 GB of 12.00 GB  20.88 GB  4    1
   └─ 100% = 100% of root ✓
 
   What the columns mean
 
-  Queue                    The queue name. (Spark) marks the queue in spark.yarn.queue, where your
-                           Spark apps run. (Oozie) marks the queue of the Oozie launchers.
+  Queue                       The queue name. (Spark) marks the queue in spark.yarn.queue, where
+                              your Spark apps run. (Oozie) marks the queue of the Oozie launchers.
 
-  Of parent                The capacity of the queue as written in capacity-scheduler.xml: its share
-                           of the parent queue (the frame title names the parent). The children of
-                           one parent must add up to 100%; the line under each frame shows the sum.
-                           A weight such as 2w gets weight / sum of weights.
+  Of parent                   The capacity of the queue as written in capacity-scheduler.xml: its
+                              share of the parent queue (the frame title names the parent). The
+                              children of one parent must add up to 100%; the line under each frame
+                              shows the sum. A weight such as 2w gets weight / sum of weights.
 
-  Guaranteed               The share of the whole cluster that the queue always gets when it has
-                           work (its capacity, times the capacity of each parent queue). If other
-                           queues borrowed it, YARN gives it back as their containers end.
+  Guaranteed                  The share of the whole cluster that the queue always gets when it has
+                              work (its capacity, times the capacity of each parent queue). If other
+                              queues borrowed it, YARN gives it back as their containers end.
 
-  Max                      The most of the cluster that the queue can use (maximum-capacity). Above
-                           Guaranteed, it can only borrow what other queues leave idle, and it gives
-                           it back when they need it.
+  Max                         The most of the cluster that the queue can use (maximum-capacity).
+                              Above Guaranteed, it can only borrow what other queues leave idle, and
+                              it gives it back when they need it.
 
-  One user                 The most of the cluster that the apps of one user can use together in
-                           this queue: user-limit-factor x Guaranteed, never more than Max. With a
-                           factor of 1, one user cannot borrow above the guaranteed share, even when
-                           the cluster is idle.
+  Per account                 The most of the cluster that the apps of one service account can use
+                              together in this queue: user-limit-factor x Guaranteed, never more
+                              than Max. With a factor of 1, one service account cannot borrow above
+                              the guaranteed share, even when the cluster is idle.
 
-  Smallest share per user  Not a column: minimum-user-limit-percent in the Settings. When several
-                           users have apps in the queue at the same time, each one gets at least
-                           this part of the queue. 100% (the default) means no sharing rule.
+  Smallest share per account  Not a column: minimum-user-limit-percent in the Settings. When several
+                              service accounts have apps in the queue at the same time, each one
+                              gets at least this part of the queue. 100% (the default) means no
+                              sharing rule.
 
-  AM pool used             Each YARN app has one ApplicationMaster (AM): for Spark in cluster mode
-                           it holds the driver, and each Oozie launcher is one too. All AMs of a
-                           queue together may use only part of it (maximum-am-resource-percent). The
-                           column shows the AM memory in use, of the most allowed. When the pool is
-                           full, new apps wait in ACCEPTED even if memory is free. Without live data
-                           it shows the range as a share of the cluster.
+  AM pool used                Each YARN app has one ApplicationMaster (AM): for Spark in cluster
+                              mode it holds the driver, and each Oozie launcher is one too. All AMs
+                              of a queue together may use only part of it
+                              (maximum-am-resource-percent). The column shows the AM memory in use,
+                              of the most allowed. When the pool is full, new apps wait in ACCEPTED
+                              even if memory is free. Without live data it shows the range as a
+                              share of the cluster.
 
-  Used                     Memory that the queue's containers use now (live data).
+  Used                        Memory that the queue's containers use now (live data).
 
-  Run / Wait               Apps that run now / apps that wait in ACCEPTED to start (live data).
+  Run / Wait                  Apps that run now / apps that wait in ACCEPTED to start (live data).
 
 
-  Example, queue root.default: it always gets 100% of the cluster and cannot grow above it. One
-  user's apps together can use up to 100% (user-limit-factor 1 x 100%). Its AM pool is 12.00 GB,
-  with 4.62 GB in use; one Spark app needs an AM of 0.88 GB, so about 13 apps fit in all, and 8 more
-  can start now.
+  Example, queue root.default: it always gets 100% of the cluster and cannot grow above it. The apps
+  of one service account together can use up to 100% (user-limit-factor 1 x 100%). Its AM pool is
+  12.00 GB, with 4.62 GB in use; one Spark app needs an AM of 0.88 GB, so about 13 apps fit in all,
+  and 8 more can start now.
 
 QUEUES NOW
 ----------
-For each queue and its main user (the one that uses the most; a new user when nobody runs jobs): the
-ApplicationMaster (AM) limit that is free, how many new jobs that is, and the memory that is free.
-When the Oozie launchers run in a queue, one job there is an Oozie job: launcher 2.00 GB + Spark AM
-0.88 GB. Each job sets its own executors, so the table does not count them.
+For each queue, one row per service account (those with jobs in it now, then those mapped to it in
+queue-mappings): the ApplicationMaster (AM) limit that is free for it, how many new jobs that is,
+and the memory that is free for it. When the Oozie launchers run in a queue, one job there is an
+Oozie job: launcher 2.00 GB + Spark AM 0.88 GB. Each job sets its own executors, so the table does
+not count them.
 
-  Queue         Main user  AM free  New jobs  Memory free  A new job now
-  root.default  svc_spark  0.00 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > user's AM limit)
+  Queue         Service account  AM free  New jobs  Memory free  A new job now
+  root.default  svc_spark        0.00 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > its AM limit)
+                hadoop           0.62 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > its AM limit)
+                svc_reports      2.62 GB  0 Oozie   3.12 GB      ✗ never (Oozie job > its AM limit)
 
   The balance sheets (every number, worked out step by step): run again with --details.
 
@@ -955,55 +1043,57 @@ The settings behind the findings. "(default)" means that the file does not have 
 YARN, Spark or Oozie uses its default. "(cluster-wide value)" means that the queue has no own value
 and uses the one for all queues.
 
-  Description                             Setting                                                           Value
+  Description                                Setting                                                           Value
 
   /etc/hadoop/conf/yarn-site.xml
-  Largest container: memory               yarn.scheduler.maximum-allocation-mb                              12288 MB
-  Largest container: vcores               yarn.scheduler.maximum-allocation-vcores                          4 (default)
-  Memory is rounded up to a multiple of   yarn.scheduler.minimum-allocation-mb                              32 MB
-  Memory per node for YARN (this host)    yarn.nodemanager.resource.memory-mb                               12288 MB
-  vcores per node for YARN (this host)    yarn.nodemanager.resource.cpu-vcores                              4
-  Node labels on                          yarn.node-labels.enabled                                          false (default)
-  Node label for ApplicationMasters       yarn.node-labels.am.default-node-label-expression                 not set
+  Largest container: memory                  yarn.scheduler.maximum-allocation-mb                              12288 MB
+  Largest container: vcores                  yarn.scheduler.maximum-allocation-vcores                          4 (default)
+  Memory is rounded up to a multiple of      yarn.scheduler.minimum-allocation-mb                              32 MB
+  Memory per node for YARN (this host)       yarn.nodemanager.resource.memory-mb                               12288 MB
+  vcores per node for YARN (this host)       yarn.nodemanager.resource.cpu-vcores                              4
+  Node labels on                             yarn.node-labels.enabled                                          false (default)
+  Node label for ApplicationMasters          yarn.node-labels.am.default-node-label-expression                 not set
 
   /etc/hadoop/conf/capacity-scheduler.xml
-  Containers are sized by                 yarn.scheduler.capacity.resource-calculator                       memory only (default)
-  AM pool of each queue (default)         yarn.scheduler.capacity.maximum-am-resource-percent               0.5 (50%)
-  Most apps (running + waiting)           yarn.scheduler.capacity.maximum-applications                      10000 (default)
-  Most running apps                       yarn.scheduler.capacity.max-parallel-apps                         not set
-  Most running apps per user              yarn.scheduler.capacity.user.max-parallel-apps                    not set
+  Containers are sized by                    yarn.scheduler.capacity.resource-calculator                       memory only (default)
+  AM pool of each queue (default)            yarn.scheduler.capacity.maximum-am-resource-percent               0.5 (50%)
+  Most apps (running + waiting)              yarn.scheduler.capacity.maximum-applications                      10000 (default)
+  Most running apps                          yarn.scheduler.capacity.max-parallel-apps                         not set
+  Most running apps per service account      yarn.scheduler.capacity.user.max-parallel-apps                    not set
+  Service accounts mapped to queues          yarn.scheduler.capacity.queue-mappings                            u:svc_spark:default,u:svc_reports:default,u:%user:%user
 
   Queue root.default
-  Guaranteed share of the parent          yarn.scheduler.capacity.root.default.capacity                     100%
-  Most share of the parent                yarn.scheduler.capacity.root.default.maximum-capacity             100% (default)
-  State                                   yarn.scheduler.capacity.root.default.state                        RUNNING (default)
-  One user: x guaranteed share            yarn.scheduler.capacity.root.default.user-limit-factor            1 (default)
-  Smallest share per active user          yarn.scheduler.capacity.root.default.minimum-user-limit-percent   100% (default)
-  AM pool share                           yarn.scheduler.capacity.root.default.maximum-am-resource-percent  0.5 (cluster-wide value)
-  Largest container: memory               yarn.scheduler.capacity.root.default.maximum-allocation-mb        cluster limit (default)
-  Most running apps                       yarn.scheduler.capacity.root.default.max-parallel-apps            no limit (default)
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.default.capacity                     100%
+  Most share of the parent                   yarn.scheduler.capacity.root.default.maximum-capacity             100% (default)
+  State                                      yarn.scheduler.capacity.root.default.state                        RUNNING (default)
+  One service account: x guaranteed share    yarn.scheduler.capacity.root.default.user-limit-factor            1 (default)
+  Smallest share per active service account  yarn.scheduler.capacity.root.default.minimum-user-limit-percent   100% (default)
+  AM pool share                              yarn.scheduler.capacity.root.default.maximum-am-resource-percent  0.5 (cluster-wide value)
+  Largest container: memory                  yarn.scheduler.capacity.root.default.maximum-allocation-mb        cluster limit (default)
+  Most running apps                          yarn.scheduler.capacity.root.default.max-parallel-apps            no limit (default)
+  Service accounts mapped here               yarn.scheduler.capacity.queue-mappings                            svc_spark, svc_reports
 
   /etc/spark/conf/spark-defaults.conf
-  Deploy mode                             spark.submit.deployMode                                           client (default)
-  Queue                                   spark.yarn.queue                                                  default (default)
-  Executor heap                           spark.executor.memory                                             4743M
-  Executor heap (EMR default)             spark.emr.default.executor.memory                                 not set
-  Executor overhead                       spark.executor.memoryOverhead                                     10% of heap, min 384 MB (default)
-  Executor vcores                         spark.executor.cores                                              4
-  Executor vcores (EMR default)           spark.emr.default.executor.cores                                  not set
-  Python worker memory per executor       spark.executor.pyspark.memory                                     not set
-  Off-heap memory on                      spark.memory.offHeap.enabled                                      false (default)
-  Dynamic allocation                      spark.dynamicAllocation.enabled                                   true
-  Fewest executors                        spark.dynamicAllocation.minExecutors                              0 (default)
-  Most executors                          spark.dynamicAllocation.maxExecutors                              no limit (default)
-  Executors (without dynamic allocation)  spark.executor.instances                                          2 (default)
-  Driver heap                             spark.driver.memory                                               2048M
-  AM heap in client mode                  spark.yarn.am.memory                                              512m (default)
+  Deploy mode                                spark.submit.deployMode                                           client (default)
+  Queue                                      spark.yarn.queue                                                  default (default)
+  Executor heap                              spark.executor.memory                                             4743M
+  Executor heap (EMR default)                spark.emr.default.executor.memory                                 not set
+  Executor overhead                          spark.executor.memoryOverhead                                     10% of heap, min 384 MB (default)
+  Executor vcores                            spark.executor.cores                                              4
+  Executor vcores (EMR default)              spark.emr.default.executor.cores                                  not set
+  Python worker memory per executor          spark.executor.pyspark.memory                                     not set
+  Off-heap memory on                         spark.memory.offHeap.enabled                                      false (default)
+  Dynamic allocation                         spark.dynamicAllocation.enabled                                   true
+  Fewest executors                           spark.dynamicAllocation.minExecutors                              0 (default)
+  Most executors                             spark.dynamicAllocation.maxExecutors                              no limit (default)
+  Executors (without dynamic allocation)     spark.executor.instances                                          2 (default)
+  Driver heap                                spark.driver.memory                                               2048M
+  AM heap in client mode                     spark.yarn.am.memory                                              512m (default)
 
   /etc/oozie/conf/oozie-site.xml
-  Launcher memory                         oozie.launcher.default.memory.mb                                  2048 MB (default)
-  Launcher vcores                         oozie.launcher.default.vcores                                     1 (default)
-  Launcher queue                          oozie.launcher.default.queue                                      default
+  Launcher memory                            oozie.launcher.default.memory.mb                                  2048 MB (default)
+  Launcher vcores                            oozie.launcher.default.vcores                                     1 (default)
+  Launcher queue                             oozie.launcher.default.queue                                      default
 
 TERMS
 -----
@@ -1023,8 +1113,9 @@ TERMS
   Guaranteed / Max        A queue always gets its guaranteed share; it can borrow up to its maximum
                           when other queues are idle.
 
-  One user                The most of the cluster that one user's apps can use in the queue
-                          (user-limit-factor x guaranteed share).
+  Per account             The most of the cluster that the apps of one service account can use in
+                          the queue (user-limit-factor x guaranteed share). YARN calls a service
+                          account a user.
 
   Oozie launcher          A small YARN app that Oozie starts for each action; it stays until the
                           action (for example the Spark job) ends.
@@ -1063,15 +1154,15 @@ leaves out what depends on the missing source.
 | Message | What to do |
 |---------|------------|
 | `... was not found at ...` | The config is in another directory: use `--hadoop-conf`, `--spark-conf`, `--oozie-conf` or the `*_CONF_DIR` variables. A missing `oozie-site.xml` is fine if you do not use Oozie. On an edge node `capacity-scheduler.xml` is often missing; the live data still shows the queues. |
-| `No permission to read ...` | Run the script as a user that can read the file (on EMR the `hadoop` user), or have it made readable. |
+| `No permission to read ...` | Run the script as an account that can read the file (on EMR, `hadoop`), or have it made readable. |
 | `... is not valid XML ...` | The file is damaged or cut off. Check it with `xmllint --noout <file>`. |
 | `Connection refused` | Nothing listens there: the ResourceManager is down, or the port is wrong (8088; 8090 with HTTPS). |
 | `Unknown host name` | Fix the host in `--rm` or in `yarn.resourcemanager.hostname`. |
 | `No answer within 15 seconds` | A firewall or security group blocks the port. On EMR, allow this host on port 8088 in the primary node's security group. |
 | `asks for Kerberos login (HTTP 401)` | Run `kinit` (check with `klist`); `curl` must be installed. |
-| `refused access (HTTP 403)` | The user may not read the REST API. Check `yarn.admin.acl` and the web UI ACLs. |
+| `refused access (HTTP 403)` | The account running the script may not read the REST API. Check `yarn.admin.acl` and the web UI ACLs. |
 | `HTTP 404` / `not JSON` | The address is not a ResourceManager web address, or a proxy login page answers. |
 | `This ResourceManager is the standby one` | Give the active ResourceManager with `--rm`. |
 | `This script needs Python 3.6 or later` | Run it with a newer `python3`. |
-| `No permission to read the EMR cluster information` | The user cannot read `/mnt/var/lib/info`. The header shows the host as an EMR node with an unknown role, and live data stays on. The rest of the report is not affected. |
+| `No permission to read the EMR cluster information` | The account running the script cannot read `/mnt/var/lib/info`. The header shows the host as an EMR node with an unknown role, and live data stays on. The rest of the report is not affected. |
 | No "Cluster" line in the header | The host has no `/mnt/var/lib/info` (not an EMR node). Live data is then off unless you add `--live`. |
