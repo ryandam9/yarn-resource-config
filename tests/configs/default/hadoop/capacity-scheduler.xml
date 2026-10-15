@@ -2,4 +2,5 @@
 <property><name>yarn.scheduler.capacity.root.queues</name><value>default</value></property>
 <property><name>yarn.scheduler.capacity.root.default.capacity</name><value>100</value></property>
 <property><name>yarn.scheduler.capacity.maximum-am-resource-percent</name><value>0.5</value></property>
+<property><name>yarn.scheduler.capacity.queue-mappings</name><value>u:svc_spark:default,u:svc_reports:default,u:%user:%user</value></property>
 </configuration>

@@ -6,6 +6,7 @@ Only the standard library, so it runs on every Python the script supports (3.6 a
 """
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -122,13 +123,41 @@ class Report(unittest.TestCase):
         never = out[out.index("NO: it can NEVER start.") :]
         self.assertNotIn("Wait until one of this user's apps ends.", never[: never.index("\n\n\n")])
 
+    def test_service_accounts(self) -> None:
+        # Spark jobs run as service accounts, mapped to queues with queue-mappings: the report names them
+        # and never says "user", apart from YARN's own property names and messages.
+        rc, out = run("default", self.servers["ok"], ["--details", "--color", "never"])
+        self.check(rc, out)
+        self.assertIn("QUEUE root.default  \u00b7  service account svc_spark\n", out)
+        self.assertIn("QUEUE root.default  \u00b7  service account svc_reports (no jobs now)", out)  # mapped only
+        self.assertIn("Service accounts mapped here", out)
+        self.assertIn("svc_spark, svc_reports", out)  # u:%user:%user names no account
+        allowed = re.compile(
+            r"user-limit-factor|minimum-user-limit-percent|userAMResourceLimit|user\.max-parallel-apps|"
+            r"%user|YARN calls (it|a service account) a user|User's AM resource limit|User AM Resource"
+        )
+        text = allowed.sub("", re.sub(r"\s+", " ", out.replace(os.path.dirname(HERE), "")))  # wrapped lines joined
+        found = re.search(r".{0,60}\b[Uu]ser(s|'s)?\b.{0,60}", text)
+        self.assertIsNone(found, found and found.group(0))
+
+    def test_oozie_launchers(self) -> None:
+        # Most jobs come from Oozie: the launcher is part of every job and counts against the AM limits.
+        rc, out = run("default", self.servers["ok"], ["--color", "never"])
+        self.check(rc, out)
+        self.assertRegex(out, r"\n  Oozie launcher +- +- +- +2\.00 GB +1\n")  # in "What one Spark job asks"
+        self.assertIn("One Spark job from Oozie, before any executor: launcher 2.00 GB + Spark AM 0.88 GB", out)
+        self.assertIn("Oozie launchers running now: 1, holding 2.00 GB of AM limit", out)  # the finding
+        joined = re.sub(r"\s+", " ", out)  # wrapped lines joined
+        self.assertIn("1 Oozie launcher holds 2.00 GB (an AM that waits for its Spark job)", joined)  # Apps
+
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])
         self.check(rc, out)
         report = out[: out.index("\nSETTINGS\n")]  # the settings keep their configured values
         for line in report.splitlines():
             if " MB" in line:  # only a property value as configured, or Spark's own rule
-                self.assertTrue("spark.yarn.am.memory" in line or "at least 384 MB" in line, line)
+                quoted = ("spark.yarn.am.memory", "oozie.launcher.default.memory.mb", "at least 384 MB")
+                self.assertTrue(any(q in line for q in quoted), line)
 
     def test_ascii_terminal(self) -> None:
         env = {"LC_ALL": "C", "LANG": "C", "PYTHONIOENCODING": "ascii"}

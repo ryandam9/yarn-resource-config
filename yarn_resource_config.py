@@ -57,7 +57,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 Json = Dict[str, Any]  # one object from the ResourceManager or Spark REST API
 Live = Dict[str, Any]  # the live data: base, metrics, queues, tree, nodes, apps
 Balance = Dict[str, Any]  # the numbers of one queue's balance sheet (see queue_balance)
-User = Dict[str, Any]  # one user's numbers in a queue (see queue_balance and user_in)
+User = Dict[str, Any]  # one service account's numbers in a queue (YARN: a user; see queue_balance, user_in)
 Why = Dict[str, Any]  # a plain explanation of one limit: title, what, calc, props, fix
 Point = Tuple[Optional[str], str]  # one bullet: mark kind ("ok", "no" or None) and text
 Check = Tuple[bool, str, Why]  # one check before an app starts: ok, short text, explanation
@@ -106,8 +106,8 @@ def _open_error(path: str, title: str, e: OSError) -> str:
         )
     if isinstance(e, PermissionError):
         return (
-            "No permission to read %s. Run the script as a user that can read it (on EMR, the "
-            "hadoop user or a user in the hadoop group), or ask an admin to make it readable." % path
+            "No permission to read %s. Run the script as an account that can read it (on EMR, "
+            "hadoop or an account in the hadoop group), or ask an admin to make it readable." % path
         )
     if isinstance(e, IsADirectoryError):
         return "%s is a directory, not a file." % path
@@ -523,7 +523,7 @@ def get_json(url: str, timeout: float = 15) -> Any:
             body = _curl_negotiate(url)
         elif e.code == 403:
             raise RMError(
-                "The ResourceManager refused access (HTTP 403). The user running the script "
+                "The ResourceManager refused access (HTTP 403). The account running the script "
                 "has no permission to read the REST API (yarn.admin.acl or the web UI ACLs)."
             ) from None
         elif e.code == 404:
@@ -698,6 +698,7 @@ class Queue:
         self.max_alloc_mb: Optional[float] = None
         self.ordering: Optional[str] = None  # ordering-policy: fifo (default) or fair
         self.live: Optional[Json] = None  # the queue from the REST API
+        self.accounts: List[str] = []  # service accounts mapped to this queue (queue-mappings)
 
     @property
     def one_user_max(self) -> Optional[float]:
@@ -767,7 +768,34 @@ def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
         q.live = lq
         if not q.ordering and lq.get("orderingPolicyInfo"):
             q.ordering = str(lq.get("orderingPolicyInfo"))
+    for account, name in queue_mappings(cs):
+        q = find_queue(queues, name)
+        if q is not None and account not in q.accounts:
+            q.accounts.append(account)
     return queues
+
+
+def queue_mappings(cs: ConfigFile) -> List[Tuple[str, str]]:
+    """The service accounts that yarn.scheduler.capacity.queue-mappings sends to a queue: [(account, queue)].
+    Only u:<account>:<queue> entries with fixed names; group (g:) and %user rules name no account."""
+    out: List[Tuple[str, str]] = []
+    for entry in cs.get("yarn.scheduler.capacity.queue-mappings", "").split(","):
+        parts = [p.strip() for p in entry.split(":")]
+        if len(parts) == 3 and parts[0] == "u" and parts[1] and parts[2] and "%" not in parts[1] + parts[2]:
+            out.append((parts[1], parts[2]))
+    return out
+
+
+def queue_accounts(q: Queue, live: Optional[Live]) -> List[str]:
+    """The service accounts of a queue: those with apps in it now (busiest first), then the ones mapped
+    to it in queue-mappings."""
+    used: Dict[str, float] = {}
+    for a in (live or {}).get("apps") or []:
+        if a.get("state") in ("RUNNING", "ACCEPTED") and find_queue({q.path: q}, str(a.get("queue", ""))) is q:
+            name = str(a.get("user", "?"))
+            used[name] = used.get(name, 0) + max(0, to_float(a.get("allocatedMB")) or 0)
+    names = sorted(used, key=lambda n: -used[n])
+    return names + [n for n in q.accounts if n not in used]
 
 
 def find_queue(queues: Dict[str, Queue], name: str) -> Optional[Queue]:
@@ -877,8 +905,8 @@ def am_limit_fixes(
     if user_level and ulf > 0 and limit:
         new_ulf = max(math.ceil(ulf * target / limit * 10) / 10.0, ulf + 0.1)
         fixes.append(
-            "Raise %suser-limit-factor %g -> %g: the user's AM limit becomes about %s (it also raises the user's "
-            "share of the queue)." % (prefix, ulf, new_ulf, gb(limit * new_ulf / ulf))
+            "Raise %suser-limit-factor %g -> %g: each service account's AM limit becomes about %s (it also raises "
+            "each service account's share of the queue)." % (prefix, ulf, new_ulf, gb(limit * new_ulf / ulf))
         )
     if am_pct and limit:
         new_pct = max(math.ceil(am_pct * target / limit * 100) / 100.0, am_pct + 0.01)
@@ -1068,10 +1096,35 @@ def find_problems(
                 "AM limit of the queue: %s (maximum-am-resource-percent %s): room for %d %ss."
                 % (gb(pool), pct(q.am_pct), in_queue, kind),
             ]
-            if user_lim:
+            held: Dict[str, List[float]] = {}  # running Oozie launchers in the queue, per account: [count, MB]
+            for app in (live or {}).get("apps") or []:
+                in_q = find_queue({q.path: q}, str(app.get("queue", ""))) is q
+                if in_q and app.get("state") == "RUNNING" and is_launcher(app):
+                    h = held.setdefault(str(app.get("user", "?")), [0, 0.0])
+                    h[0] += 1
+                    h[1] += max(0, to_float(app.get("allocatedMB")) or 0)
+            if held:
                 facts.append(
-                    "AM limit of each user: %s: room for %d %s%s per user. All jobs of one account (for example "
-                    "a service account) share it." % (gb(user_lim), per_user or 0, kind, "" if per_user == 1 else "s")
+                    "Oozie launchers running now: %d, holding %s of AM limit while they wait for their Spark jobs "
+                    "(%s)."
+                    % (
+                        sum(int(h[0]) for h in held.values()),
+                        gb(sum(h[1] for h in held.values())),
+                        ", ".join("%s %d, %s" % (n, int(h[0]), gb(h[1])) for n, h in sorted(held.items())),
+                    )
+                )
+            if user_lim:
+                accounts = queue_accounts(q, live)
+                facts.append(
+                    "AM limit of each service account%s: %s: room for %d %s%s per service account. All jobs of "
+                    "one service account share it."
+                    % (
+                        " (%s)" % ", ".join(accounts) if accounts else "",
+                        gb(user_lim),
+                        per_user or 0,
+                        kind,
+                        "" if per_user == 1 else "s",
+                    )
                 )
             fixes = am_limit_fixes(
                 q.path, q.ulf, q.am_pct, limit, 0.0, need, launcher_mb if l_here else 0.0, am.size, bool(user_lim)
@@ -1084,10 +1137,10 @@ def find_problems(
                     + [
                         (
                             "no",
-                            "%s is more than the %s AM limit (%s), so the job never starts%s."
+                            "%s is more than %s AM limit (%s), so the job never starts%s."
                             % (
                                 gb(need),
-                                "user's" if user_lim and user_lim <= pool else "queue's",
+                                "each service account's" if user_lim and user_lim <= pool else "the queue's",
                                 gb(limit),
                                 ": the launcher starts, and the Spark AM then waits in ACCEPTED for good"
                                 if l_here
@@ -1113,7 +1166,13 @@ def find_problems(
                 add(
                     "OK" if most >= 3 else "WARNING",
                     "The AM limits of queue %s allow about %d %s%s at once%s"
-                    % (q.path, most, kind, "" if most == 1 else "s", " per user" if per_user is not None else ""),
+                    % (
+                        q.path,
+                        most,
+                        kind,
+                        "" if most == 1 else "s",
+                        " per service account" if per_user is not None else "",
+                    ),
                     facts + ["The card for the queue (near the top) shows what is free now."],
                     None if most >= 3 else fixes,
                 )
@@ -1143,19 +1202,20 @@ def find_problems(
         need = qq.abs_max / qq.abs_cap if qq.abs_cap else None
         add(
             "WARNING" if qq is q else "NOTE",
-            "In queue %s one user can use only %s of the cluster" % (path, pct(one)),
+            "In queue %s one service account can use only %s of the cluster" % (path, pct(one)),
             "The queue can grow to %s of the cluster when other queues are idle, but user-limit-factor "
-            "%.3g stops one user at %.3g x the queue's guaranteed %s. YARN checks the limit before it "
-            "starts each container, so a user can go over it by up to one container. If one user runs "
-            "the apps, they wait while part of the cluster stays idle."
+            "%.3g stops one service account at %.3g x the queue's guaranteed %s. YARN checks the limit before "
+            "it starts each container, so a service account can go over it by up to one container. If one "
+            "service account runs the apps, they wait while part of the cluster stays idle."
             % (pct(qq.abs_max), qq.ulf, qq.ulf, pct(qq.abs_cap)),
             "Set yarn.scheduler.capacity.%s.user-limit-factor to %.2f or more." % (path, need) if need else None,
         )
         if qq.min_user_pct < 100:
             add(
                 "NOTE",
-                "In queue %s each waiting user gets at least %.0f%% of the queue" % (path, qq.min_user_pct),
-                "With several active users, YARN shares the queue between them (minimum-user-limit-percent).",
+                "In queue %s each waiting service account gets at least %.0f%% of the queue" % (path, qq.min_user_pct),
+                "With several active service accounts, YARN shares the queue between them "
+                "(minimum-user-limit-percent).",
             )
 
     # ---- what Spark itself limits
@@ -1195,7 +1255,7 @@ def find_problems(
                 "WARNING",
                 title,
                 "The apps stay in ACCEPTED. Their AM pool has room, so the queue is probably at its "
-                'limit (see "One user max" and "Max" in the queue table) or no node has room.',
+                'limit (see "Per account" and "Max" in the queue table) or no node has room.',
             )
     # ---- running apps that do not get what they ask for (live)
     starved = (
@@ -1219,7 +1279,7 @@ def find_problems(
             None,
         )
 
-    # ---- apps that wait because one user's AM limit is full (live)
+    # ---- apps that wait because one service account's AM limit is full (live)
     blocked: Dict[Tuple[str, str], List[Json]] = {}
     for a in (live or {}).get("apps") or []:
         if a.get("state") == "ACCEPTED" and "user's am resource limit exceeded" in (a.get("diagnostics") or "").lower():
@@ -1228,13 +1288,15 @@ def find_problems(
         bq = find_queue(queues, qname)
         add(
             "PROBLEM",
-            "%d app%s of user %s wait%s: the user's AM limit is full"
+            "%d app%s of %s wait%s: its AM limit is full"
             % (len(group), "" if len(group) == 1 else "s", user, "s" if len(group) == 1 else ""),
-            "YARN gives each user only part of a queue's AM pool, and all apps of one user share it. "
+            "YARN gives each service account only part of a queue's AM pool, and all apps of one service "
+            "account share it. "
             "The running apps of %s in queue %s hold all of it, so its new apps stay in ACCEPTED, even "
             "if the queue has room. A service account that submits many apps meets this limit first."
             % (user, bq.path if bq else qname),
-            "Raise yarn.scheduler.capacity.%s.user-limit-factor (the user AM limit grows with it), or run fewer "
+            "Raise yarn.scheduler.capacity.%s.user-limit-factor (each service account's AM limit grows with it), "
+            "or run fewer "
             "apps at the same time. The card for the queue (near the top) has values." % (bq.path if bq else qname),
         )
     return sorted(out, key=lambda f: Finding.ORDER[f.level])
@@ -1264,8 +1326,9 @@ TERMS = [
         "A queue always gets its guaranteed share; it can borrow up to its maximum when other queues are idle.",
     ),
     (
-        "One user",
-        "The most of the cluster that one user's apps can use in the queue (user-limit-factor x guaranteed share).",
+        "Per account",
+        "The most of the cluster that the apps of one service account can use in the queue (user-limit-factor x "
+        "guaranteed share). YARN calls a service account a user.",
     ),
     (
         "Oozie launcher",
@@ -1312,13 +1375,17 @@ def print_findings(findings: List[Finding]) -> None:
         print()
 
 
-def print_containers(executor: Container, am: Container, deploy: str, spark: ConfigFile) -> None:
+def print_containers(
+    executor: Container, am: Container, deploy: str, spark: ConfigFile, oozie: ConfigFile, l_size: Optional[int]
+) -> None:
     section(
-        "What one Spark app asks YARN for",
-        "From spark-defaults.conf (deploy mode: %s). Options given to spark-submit (--conf, "
-        "--executor-memory, ...) change these for one app." % deploy,
+        "What one Spark job asks YARN for",
+        "From spark-defaults.conf (deploy mode: %s)%s. Options given to spark-submit (--conf, "
+        "--executor-memory, ...) change these for one app." % (deploy, " and oozie-site.xml" if l_size else ""),
     )
     rows = []
+    if l_size:  # an Oozie job starts with its launcher, one container that is an AM of its own
+        rows.append(["Oozie launcher", "-", "-", "-", gb(l_size), oozie.get("oozie.launcher.default.vcores", "1")])
     for c in (executor, am):
         rows.append([c.name, gb(c.heap), gb(c.overhead), gb(c.other) if c.other else "-", gb(c.size), str(c.vcores)])
     table(
@@ -1349,6 +1416,23 @@ def print_containers(executor: Container, am: Container, deploy: str, spark: Con
     else:
         count = "%s (spark.executor.instances)" % spark.get("spark.executor.instances", "2")
     print(highlight(wrap("Number of executors per app: %s." % count, "  ")))
+    if l_size:
+        print()
+        bullets(
+            [
+                "Oozie launcher: oozie.launcher.default.memory.mb %s MB, rounded up to %s; it runs in queue %s "
+                "(oozie.launcher.default.queue) and stays until its Spark job ends."
+                % (
+                    oozie.get("oozie.launcher.default.memory.mb", "2048"),
+                    gb(l_size),
+                    oozie.get("oozie.launcher.default.queue", "default"),
+                ),
+                "The launcher is an ApplicationMaster too, so it counts against the same AM limits as the Spark AM.",
+                "One Spark job from Oozie, before any executor: launcher %s + Spark AM %s = %s."
+                % (gb(l_size), gb(am.size), gb(l_size + am.size)),
+            ],
+            "  ",
+        )
 
 
 QUEUE_COLUMNS = [
@@ -1375,15 +1459,15 @@ QUEUE_COLUMNS = [
         "only borrow what other queues leave idle, and it gives it back when they need it.",
     ),
     (
-        "One user",
-        "The most of the cluster that the apps of one user can use together in this queue: "
-        "user-limit-factor x Guaranteed, never more than Max. With a factor of 1, one user cannot "
-        "borrow above the guaranteed share, even when the cluster is idle.",
+        "Per account",
+        "The most of the cluster that the apps of one service account can use together in this queue: "
+        "user-limit-factor x Guaranteed, never more than Max. With a factor of 1, one service account "
+        "cannot borrow above the guaranteed share, even when the cluster is idle.",
     ),
     (
-        "Smallest share per user",
+        "Smallest share per account",
         "Not a column: minimum-user-limit-percent in the Settings. When several "
-        "users have apps in the queue at the same time, each one gets at least this "
+        "service accounts have apps in the queue at the same time, each one gets at least this "
         "part of the queue. 100% (the default) means no sharing rule.",
     ),
     (
@@ -1414,17 +1498,17 @@ def queue_example(q: Queue, am: Container) -> str:
         )
     if q.one_user_max is not None:
         if q.ulf <= 0:
-            text += " One user has no limit inside it (user-limit-factor %g)." % q.ulf
+            text += " One service account has no limit inside it (user-limit-factor %g)." % q.ulf
         else:
-            text += " One user's apps together can use up to %s (user-limit-factor %g x %s)." % (
+            text += " The apps of one service account together can use up to %s (user-limit-factor %g x %s)." % (
                 pct(q.one_user_max),
                 q.ulf,
                 pct(q.abs_cap),
             )
             if q.abs_max is not None and q.one_user_max < q.abs_max - 1e-9:
                 text += (
-                    " So one user alone cannot use the part between %s and %s; that needs a second "
-                    "user, or a higher user-limit-factor." % (pct(q.one_user_max), pct(q.abs_max))
+                    " So one service account alone cannot use the part between %s and %s; that needs a "
+                    "second service account, or a higher user-limit-factor." % (pct(q.one_user_max), pct(q.abs_max))
                 )
     am_limit = q.live_mb("AMResourceLimit")
     if am_limit:
@@ -1589,7 +1673,7 @@ def print_queues(
             return "%s (%s)" % (c["raw"], pct(c["share"]))
         return "%g%%" % (c["share"] * 100)
 
-    headers = ["Queue", "Of parent", "Guaranteed", "Max", "One user", "AM pool used", "Used", "Run", "Wait"]
+    headers = ["Queue", "Of parent", "Guaranteed", "Max", "Per account", "AM pool used", "Used", "Run", "Wait"]
     roles = ["queue", None, None, None, None, None, None, None, lambda c: "bad" if c not in ("0", "-") else None]
     blocks: List[Tuple[str, Tuple[str, Optional[str]], List[List[str]]]] = []
     shown: Set[str] = set()
@@ -1751,12 +1835,18 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
     # from the user's apps in this queue, for Hadoop versions without per-user numbers
     by_app: Dict[str, float] = {}
     counts: Dict[str, List[int]] = {}
+    # the Oozie launchers that run in the queue now, per service account: [count, MB]; each is one AM
+    b["launchers"] = {}
     for a in live.get("apps") or []:
         if find_queue({q.path: q}, str(a.get("queue", ""))) is q:
             user = str(a.get("user", "?"))
             by_app[user] = by_app.get(user, 0) + max(0, to_float(a.get("allocatedMB")) or 0)
             c = counts.setdefault(user, [0, 0])
             c[0 if a.get("state") == "RUNNING" else 1] += 1
+            if a.get("state") == "RUNNING" and is_launcher(a):
+                n = b["launchers"].setdefault(user, [0, 0.0])
+                n[0] += 1
+                n[1] += max(0, to_float(a.get("allocatedMB")) or 0)
     for u in queue_users(lq):
         name = str(u.get("username", "?"))
         used = res(u.get("resourcesUsed"))
@@ -1782,15 +1872,25 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
     return b
 
 
-NEW_USER = "a new user"
+NEW_USER = "a service account with no jobs here"  # YARN calls a service account a user
 
 
 def who(user: User) -> str:
-    return user["name"] if user["name"] == NEW_USER else "user " + user["name"]
+    return user["name"] if user["name"] == NEW_USER else "service account " + user["name"]
+
+
+def cap(text: str) -> str:
+    """Capitalize the first letter only (str.capitalize would lower svc_Name)."""
+    return text[:1].upper() + text[1:]
+
+
+def account(user: User) -> str:
+    """The service account's name, or a plain description when it has no name."""
+    return user["name"]
 
 
 def user_in(b: Balance, name: Optional[str]) -> User:
-    """The numbers of one user in a queue; a user without apps there starts fresh."""
+    """The numbers of one service account in a queue; one without apps there starts fresh."""
     for u in b["users"]:
         if u["name"] == name:
             return u
@@ -1891,31 +1991,31 @@ def why_room(b: Balance, scope: str, need: float, what: str) -> Why:
 def why_user_limit(b: Balance, user: User, need: float, what: str, same_u: float) -> Why:
     q = b["q"]
     capped = b["ulf"] > 0 and b["ulf"] * b["guar"][0] > b["max"][0]
-    name = "A new user" if user["name"] == NEW_USER else user["name"]
+    name = account(user)
     if b["ulf"] > 0:
-        limit_line = "User limit: user-limit-factor %g x guaranteed %s = %s%s" % (
+        limit_line = "Limit per service account: user-limit-factor %g x guaranteed %s = %s%s" % (
             b["ulf"],
             gb(b["guar"][0]),
             gb(b["ulf"] * b["guar"][0]),
             ", cut to the queue max %s" % gb(b["max"][0]) if capped else "",
         )
-    else:  # -1 (Hadoop 3.3+): no user limit, so one user may use the queue max
-        limit_line = "User limit: user-limit-factor %g means no user limit, so it is the queue max: %s" % (
+    else:  # -1 (Hadoop 3.3+): no user limit, so one service account may use the queue max
+        limit_line = "Limit per service account: user-limit-factor %g means no limit, so it is the queue max: %s" % (
             b["ulf"],
             gb(b["max"][0]),
         )
-    fix = ["Wait until one of this user's apps ends."]
+    fix = ["Wait until one of the apps of %s ends." % name]
     if b["guar"][0] and b["ulf"] > 0 and not capped:
         fix.append(
-            "Or raise user-limit-factor of queue %s. With %.2f or more, one user may use the whole "
+            "Or raise user-limit-factor of queue %s. With %.2f or more, one service account may use the whole "
             "queue max (%s)." % (q.path, b["max"][0] / b["guar"][0], gb(b["max"][0]))
         )
     return {
-        "title": "%s has reached its user limit in queue %s" % (who(user).capitalize(), q.path),
+        "title": "%s has reached its limit in queue %s" % (cap(who(user)), q.path),
         "what": [
-            "One user's apps together may use only part of a queue.",
-            "YARN counts per user, not per app: all apps of one account (for example a service "
-            "account) share this limit.",
+            "The apps of one service account together may use only part of a queue.",
+            "YARN counts per service account (YARN calls it a user), not per app: all apps of one "
+            "service account share this limit.",
         ],
         "calc": [
             (None, limit_line),
@@ -1988,9 +2088,9 @@ def why_user_am(b: Balance, user: User, need: float, what: str, same_u: float) -
         )
     else:
         how = "Worked out by YARN from maximum-am-resource-percent, user-limit-factor and minimum-user-limit-percent"
-    name = "A new user" if user["name"] == NEW_USER else user["name"]
+    name = account(user)
     calc: List[Tuple[Optional[str], str]] = [
-        (None, "User AM limit: %s (YARN's figure, userAMResourceLimit)" % gb(user["am_limit"])),
+        (None, "AM limit per service account: %s (YARN's figure, userAMResourceLimit)" % gb(user["am_limit"])),
         (None, how),
         (
             None,
@@ -2007,11 +2107,11 @@ def why_user_am(b: Balance, user: User, need: float, what: str, same_u: float) -
         )
     )
     return {
-        "title": "%s has reached its AM limit in queue %s" % (who(user).capitalize(), q.path),
+        "title": "%s has reached its AM limit in queue %s" % (cap(who(user)), q.path),
         "what": [
-            "YARN limits the AMs of each user, not only of the whole queue.",
-            "All apps of one account share this limit.",
-            "So one service account can block itself, while the AM pool still has room for other users.",
+            "YARN limits the AMs of each service account, not only of the whole queue.",
+            "All apps of one service account share this limit.",
+            "So one service account can block itself, while the AM pool still has room for other service accounts.",
         ],
         "calc": calc,
         "props": [
@@ -2020,10 +2120,10 @@ def why_user_am(b: Balance, user: User, need: float, what: str, same_u: float) -
             qprop(q, "minimum-user-limit-percent"),
         ],
         "fix": [
-            "Wait until one of this user's apps ends.",
+            "Wait until one of the apps of %s ends." % name,
             "Or raise user-limit-factor of queue %s." % q.path,
             "Or raise maximum-am-resource-percent of queue %s." % q.path,
-            "Or run some apps under another account: each user has its own AM limit.",
+            "Or run some apps under another service account mapped to this queue: each has its own AM limit.",
         ],
     }
 
@@ -2123,7 +2223,7 @@ def am_step(
             (
                 user_left >= size,
                 pre
-                + "user limit of %s in %s: %s left (limit %s, uses %s)"
+                + "limit of %s in %s: %s left (limit %s, uses %s)"
                 % (user["name"], q.path, gb(max(0, user_left)), gb(user["limit"]), gb(user["used"] + same_u)),
                 why_user_limit(b, user, size, what, same_u),
             )
@@ -2304,7 +2404,8 @@ def print_balance(
             print(
                 highlight(
                     wrap(
-                        "Each user may use at most %s of the AM pool (userAMResourceLimit)." % gb(b["user_am_limit"]),
+                        "Each service account may use at most %s of the AM pool (userAMResourceLimit)."
+                        % gb(b["user_am_limit"]),
                         "      ",
                     )
                 )
@@ -2312,7 +2413,10 @@ def print_balance(
 
     if b["users"]:
         print()
-        print("    " + paint("Users with apps in this queue (the user limit is per user, not per app)", "label"))
+        print(
+            "    "
+            + paint("Service accounts with apps in this queue (the limit is per service account, not per app)", "label")
+        )
         rows = []
         for u in b["users"]:
             left = u["limit"] - u["used"] if u["limit"] else None
@@ -2330,7 +2434,7 @@ def print_balance(
                 ]
             )
         table(
-            ["User", "Run / wait", "User limit", "Used", "Left", "AM limit", "AM used", "AM left"],
+            ["Service account", "Run / wait", "Limit", "Used", "Left", "AM limit", "AM used", "AM left"],
             rows,
             indent="      ",
             roles=[
@@ -2345,14 +2449,14 @@ def print_balance(
             ],
         )
         notes = [
-            "User limit: the most one user may use in this queue.",
+            "Limit: the most one service account may use in this queue.",
             "It is user-limit-factor %g x guaranteed %s, at most the queue max." % (b["ulf"], gb(b["guar"][0]))
             if b["ulf"] > 0
-            else "user-limit-factor %g means no user limit, so it is the queue max." % b["ulf"],
+            else "user-limit-factor %g means no limit per service account, so it is the queue max." % b["ulf"],
         ]
         if len(b["users"]) > 1 and b["q"].min_user_pct < 100:
             notes.append(
-                "When several users want more at the same time, YARN also splits the queue between "
+                "When several service accounts want more at the same time, YARN also splits the queue between "
                 "them (minimum-user-limit-percent %g%%), so each may get less." % b["q"].min_user_pct
             )
         bullets(notes, "      ")
@@ -2360,8 +2464,10 @@ def print_balance(
     print()
     print("    " + paint("Can a new Spark app start here now?", "label"))
     users = list(b["users"])
-    if oozie:  # the users of the launcher queue may start workflows too
+    if oozie:  # the service accounts of the launcher queue may start workflows too
         users += [u for u in oozie[0]["users"] if all(u["name"] != w["name"] for w in users)]
+    # and the service accounts mapped to the queue (queue-mappings) that have no apps now
+    users += [user_in(b, n) for n in b["q"].accounts if all(n != w["name"] for w in users)]
     users = users or [None]
     seen: Set[str] = set()
     for user in users:
@@ -2402,7 +2508,7 @@ def print_balance(
             limits = [
                 (lim, text)
                 for lim, text in (
-                    (user_in(b, name)["am_limit"], "the AM limit of one user"),
+                    (user_in(b, name)["am_limit"], "the AM limit of one service account"),
                     (b["am_limit"], "the AM pool of the queue"),
                 )
                 if lim
@@ -2428,15 +2534,15 @@ def print_balance(
                     "The launcher keeps its %s while it waits." % gb(launcher_size),
                     "So the workflow hangs until the limit below frees up.",
                 ]
-            if never:  # waiting or another account does not help: every user has the same AM limit
+            if never:  # waiting or another account does not help: every service account has the same AM limit
                 checks = [(ok, text, never_fixes(why)) for ok, text, why in checks]
             print_verdict(yes, executors, b["executor_size"], why_not, checks, why_exec, seen)
-    if not b["users"]:
+    if not b["users"] and not b["q"].accounts:
         print(
             highlight(
                 wrap(
-                    "No user has apps in this queue now, so the check is for a user that starts "
-                    "fresh (user limit %s)." % gb(b["one_user"]),
+                    "No service account has apps in this queue now, and none is mapped to it "
+                    "(queue-mappings), so the check is for one that starts fresh (limit %s)." % gb(b["one_user"]),
                     "      ",
                 )
             )
@@ -2446,7 +2552,7 @@ def print_balance(
 
 def never_fixes(why: Why) -> Why:
     """The same explanation without the fixes that cannot help a job that never fits."""
-    fix = [f for f in why.get("fix", []) if not f.startswith("Wait") and "another account" not in f]
+    fix = [f for f in why.get("fix", []) if not f.startswith("Wait") and "another service account" not in f]
     if fix and fix[0].startswith("Or "):
         fix[0] = fix[0][3].upper() + fix[0][4:]
     return dict(why, fix=fix)
@@ -2537,7 +2643,7 @@ def launcher_size(files: Dict[str, ConfigFile], min_alloc: float) -> Optional[in
 
 
 def queue_summary(b: Balance, user: User, am: float, launcher: float) -> Dict[str, Any]:
-    """The state of one queue for one user in a few numbers, for the overview table and --watch.
+    """The state of one queue for one service account in a few numbers, for the overview table and --watch.
     launcher: the size of an Oozie launcher when the launchers run in this queue, else 0."""
     need = am + launcher
     user_free = (user["am_limit"] - user["am_used"]) if user["am_limit"] else None
@@ -2552,9 +2658,9 @@ def queue_summary(b: Balance, user: User, am: float, launcher: float) -> Dict[st
     if b["q"].state != "RUNNING":
         kind, text = "no", "stopped"
     elif launcher and user["am_limit"] and need > user["am_limit"]:
-        kind, text = "no", "never (Oozie job > user's AM limit)"
+        kind, text = "no", "never (Oozie job > its AM limit)"
     elif user_free is not None and user_free < need:
-        kind, text = "no", "waits: user's AM limit"
+        kind, text = "no", "waits: its AM limit is full"
     elif pool_free is not None and pool_free < need:
         kind, text = "no", "waits: queue's AM limit"
     elif mem_free < need or b["node_free"] < am:
@@ -2570,7 +2676,7 @@ def queue_summary(b: Balance, user: User, am: float, launcher: float) -> Dict[st
         "kind": kind,
         "text": text,
         "need": need,
-        "who": "a new user" if user["name"] == NEW_USER else user["name"],
+        "who": "none mapped" if user["name"] == NEW_USER else user["name"],
     }
 
 
@@ -2587,16 +2693,17 @@ def print_balances(
     launcher_size: Optional[int] = None,
     details: bool = False,
 ) -> None:
-    """Every queue in one table: what is free for its main user now. With --details, the balance sheets
-    (every number, worked out step by step) of the queues that matter follow."""
+    """Every queue in one table, one row per service account: what is free for it now. With --details, the
+    balance sheets (every number, worked out step by step) of the queues that matter follow."""
     balances = [b for b in (queue_balance(queues[p], live, am.size, executor.size) for p in sorted(queues)) if b]
     if not balances:
         return
     l_size = float(launcher_size or 0)
     section(
         "Queues now",
-        "For each queue and its main user (the one that uses the most; a new user when nobody runs jobs): "
-        "the ApplicationMaster (AM) limit that is free, how many new jobs that is, and the memory that is free. "
+        "For each queue, one row per service account (those with jobs in it now, then those mapped to it in "
+        "queue-mappings): the ApplicationMaster (AM) limit that is free for it, how many new jobs that is, and "
+        "the memory that is free for it. "
         + (
             "When the Oozie launchers run in a queue, one job there is an Oozie job: launcher %s + Spark AM %s. "
             % (gb(l_size), gb(am.size))
@@ -2607,25 +2714,25 @@ def print_balances(
     )
     rows: List[List[str]] = []
     for b in balances:
-        user = max(b["users"], key=lambda u: u["used"]) if b["users"] else user_in(b, None)
         here = l_size if (launcher_queue is not None and b["q"] is launcher_queue) else 0.0
-        s = queue_summary(b, user, float(am.size), here)
-        rows.append(
-            [
-                b["q"].path,
-                s["who"],
-                gb(s["am_free"]) if s["am_free"] is not None else "-",
-                ("%d %s" % (s["jobs"], "Oozie" if here else "Spark")) if s["jobs"] is not None else "-",
-                gb(s["mem_free"]),
-                (MARK_OK if s["kind"] == "ok" else BOX["no"]) + " " + s["text"],
-            ]
-        )
+        for i, name in enumerate(queue_accounts(b["q"], live) or [None]):
+            s = queue_summary(b, user_in(b, name), float(am.size), here)
+            rows.append(
+                [
+                    b["q"].path if i == 0 else "",
+                    s["who"],
+                    gb(s["am_free"]) if s["am_free"] is not None else "-",
+                    ("%d %s" % (s["jobs"], "Oozie" if here else "Spark")) if s["jobs"] is not None else "-",
+                    gb(s["mem_free"]),
+                    (MARK_OK if s["kind"] == "ok" else BOX["no"]) + " " + s["text"],
+                ]
+            )
 
     def status_role(c: str) -> str:
         return "good" if c.startswith(MARK_OK) else "bad"
 
     table(
-        ["Queue", "Main user", "AM free", "New jobs", "Memory free", "A new job now"],
+        ["Queue", "Service account", "AM free", "New jobs", "Memory free", "A new job now"],
         rows,
         roles=["queue", None, "value", None, "value", status_role],
     )
@@ -2840,8 +2947,13 @@ def print_queue_card(
 ) -> None:
     q = b["q"]
     am = float(b["am_size"])
-    name = "a new user" if user["name"] == NEW_USER else user["name"]
-    who_text = "no jobs now (checked for a new user)" if user["name"] == NEW_USER else "user " + name
+    name = user["name"]
+    if user["name"] == NEW_USER:
+        who_text = "no service account has jobs here or is mapped here"
+    elif user["apps"] or user["waiting"] or user["used"]:
+        who_text = "service account " + name
+    else:
+        who_text = "service account %s (no jobs now)" % name
     title = "QUEUE %s  %s  %s" % (q.path, DOT, who_text)
     print()
     print(paint(title, "section"))
@@ -2927,7 +3039,7 @@ def print_queue_card(
             (None, "One Oozie job needs", "launcher %s + Spark AM %s" % (gb(l_size), gb(am)), gb(l_size + am))
         )
 
-    # ---- 1: the user's AM limit
+    # ---- 1: the service account's AM limit
     if user["am_limit"]:
         free_u = max(0.0, user_am_left or 0.0)
         n = int(free_u // need)
@@ -2952,11 +3064,11 @@ def print_queue_card(
             + [
                 (None, "Guaranteed capacity", "the queue's capacity, as a share of the cluster", gb(b["guar"][0])),
                 (None, "AM percent", "maximum-am-resource-percent", pct(b["am_pct"])),
-                (None, "User limit factor", "user-limit-factor", "%g" % b["ulf"]),
+                (None, "Limit factor", "user-limit-factor", "%g" % b["ulf"]),
                 (
                     None,
-                    "User share",
-                    "the larger of minimum-user-limit-percent %g%% and 1 / %d active user%s"
+                    "Share per account",
+                    "the larger of minimum-user-limit-percent %g%% and 1 / %d active service account%s"
                     % (q.min_user_pct, active, "" if active == 1 else "s"),
                     pct(share),
                 ),
@@ -2976,8 +3088,10 @@ def print_queue_card(
                 (
                     None,
                     "Used",
-                    "the AMs of %s's %d running app%s (launchers and Spark AMs)"
-                    % (name, jobs_now, "" if jobs_now == 1 else "s"),
+                    "the AMs of %s's %d running app%s: %s"
+                    % (name, jobs_now, "" if jobs_now == 1 else "s", am_mix(b, name, jobs_now))
+                    if jobs_now
+                    else "%s has no running apps" % name,
                     gb(user["am_used"]),
                 ),
                 (
@@ -3007,6 +3121,13 @@ def print_queue_card(
             else "full for a new %s" % ("Oozie job" if l_here else "AM"),
         )
         holders = ", ".join("%s %s" % (u["name"], gb(u["am_used"])) for u in b["users"] if u["am_used"])
+        l_n = sum(int(v[0]) for v in b.get("launchers", {}).values())
+        if l_n:
+            holders += "; %d Oozie launcher%s %s" % (
+                l_n,
+                "" if l_n == 1 else "s",
+                gb(sum(v[1] for v in b["launchers"].values())),
+            )
         n_apps = (q.live or {}).get("numActiveApplications", "?")
         rows = [
             (None, "AM percent", "maximum-am-resource-percent", pct(b["am_pct"])),
@@ -3050,7 +3171,7 @@ def print_queue_card(
             gb(b["guar"][0]),
         )
     else:
-        share_formula = "user-limit-factor %g: no user limit, so the queue max" % b["ulf"]
+        share_formula = "user-limit-factor %g: no limit per service account, so the queue max" % b["ulf"]
     rows = [
         (
             None,
@@ -3081,7 +3202,7 @@ def print_queue_card(
             (
                 None,
                 "Used by %s" % name,
-                "its %d running app%s" % (jobs_now, "" if jobs_now == 1 else "s"),
+                "its %d running app%s" % (jobs_now, "" if jobs_now == 1 else "s") if jobs_now else "no running apps",
                 gb(user["used"]),
             ),
             (
@@ -3211,7 +3332,8 @@ def print_queue_cards(
     files: Dict[str, ConfigFile],
     l_size: Optional[int],
 ) -> None:
-    """One card per queue named with --queue, and per user with apps in it (or a new user)."""
+    """One card per queue named with --queue, and per service account in it: those with apps there now,
+    then those mapped to it in queue-mappings."""
     section(
         "Can a new job start?",
         "One card for each queue named with --queue, or else for the queues that matter: Spark's queue "
@@ -3243,13 +3365,13 @@ def print_queue_cards(
                 )
             )
             continue
-        for user in sorted(b["users"], key=lambda u: -u["used"]) or [user_in(b, None)]:
-            print_queue_card(b, user, am, oozie, uses_vcores)
+        for account_name in queue_accounts(q, live) or [None]:
+            print_queue_card(b, user_in(b, account_name), am, oozie, uses_vcores)
 
 
 # What YARN says when an app waits in ACCEPTED, in plain words
 WAIT_REASONS = [
-    ("user's am resource limit exceeded", "user's AM limit is full"),
+    ("user's am resource limit exceeded", "its service account's AM limit is full"),
     ("queue's am resource limit exceeded", "queue's AM pool is full"),
     ("am resource limit exceeded", "an AM limit is full"),
     ("waiting for am container to be allocated", "no node has room for its AM"),
@@ -3280,13 +3402,32 @@ def elapsed(ms: Any) -> str:
     return "%dm%02ds" % (sec // 60, sec % 60)
 
 
+def am_mix(b: Balance, name: str, apps: int) -> str:
+    """What the running AMs of one service account are: how many Oozie launchers and Spark AMs."""
+    n, mb = b.get("launchers", {}).get(name, [0, 0.0])
+    if not n:
+        return "Spark AMs"
+    return "%d Oozie launcher%s (%s)%s" % (
+        n,
+        "" if n == 1 else "s",
+        gb(mb),
+        " + %d Spark AM%s" % (apps - n, "" if apps - n == 1 else "s") if apps > n else "",
+    )
+
+
+def is_launcher(app: Json) -> bool:
+    """An Oozie launcher: one container, an AM of its own, that waits for the job it started."""
+    return (
+        str(app.get("name", "")).startswith("oozie:launcher") or "oozie" in str(app.get("applicationType", "")).lower()
+    )
+
+
 def doing_now(app: Json) -> str:
     """What one app does now, in a few words."""
     if app.get("state") == "ACCEPTED":
         return "waiting: " + wait_reason(app)[0]
-    name = str(app.get("name", ""))
     stages = app.get("_stages")
-    if name.startswith("oozie:launcher"):
+    if is_launcher(app):
         text = "Oozie launcher: waits for its child job"
     elif stages:
         st = sorted(stages, key=lambda x: x.get("stageId", 0))[0]
@@ -3394,11 +3535,11 @@ def why_no_resources(app: Json, live: Live, queues: Dict[str, Queue]) -> Optiona
                 head,
                 (
                     "no",
-                    "user %s is at its limit in queue %s: uses %s, may use %s (user-limit-factor %g x "
+                    "service account %s is at its limit in queue %s: uses %s, may use %s (user-limit-factor %g x "
                     "guaranteed %s); all its apps share it"
                     % (user, q.path, gb(user_used), gb(q.one_user_max * total), q.ulf, pct(q.abs_cap)),
                 ),
-                (None, "Fix: raise user-limit-factor of %s, or wait for this user's containers to end" % q.path),
+                (None, "Fix: raise user-limit-factor of %s, or wait for this account's containers to end" % q.path),
             ]
         # A maximum of the whole cluster is no queue limit: then the cluster itself is full (below)
         if q.abs_max is not None and q.abs_max < 0.999 and q_used + need > q.abs_max * total:
@@ -3479,7 +3620,7 @@ def why_no_resources(app: Json, live: Live, queues: Dict[str, Queue]) -> Optiona
 
 
 def app_users(live: Optional[Live], queues: Dict[str, Queue]) -> List[Tuple[Tuple[str, str], List[Json]]]:
-    """Group the apps by queue and user: [(queue path, user, apps)] with the busiest group first."""
+    """Group the apps by queue and service account: [(queue path, account, apps)] with the busiest group first."""
     groups: Dict[Tuple[str, str], List[Json]] = {}
     for a in (live or {}).get("apps") or []:
         qname = str(a.get("queue", "?"))
@@ -3495,9 +3636,9 @@ def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
     total = to_float(live["metrics"].get("totalMB")) or 0
     section(
         "Apps",
-        "The apps that run or wait in YARN now, grouped by queue and user. YARN counts the "
-        "user limit per user, not per app: all apps of one account (for example a service "
-        "account) share one user limit.",
+        "The apps that run or wait in YARN now, grouped by queue and service account. YARN counts its "
+        "limits per service account (YARN calls it a user), not per app: all apps of one service account "
+        "share them.",
     )
     listed = len(apps)
     reported = (live["metrics"].get("appsRunning") or 0) + (live["metrics"].get("appsPending") or 0)
@@ -3506,7 +3647,7 @@ def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
             paint(
                 wrap(
                     "The ResourceManager reports %d running or waiting apps but shows only %d to this "
-                    "user. YARN ACLs (yarn.acl.enable) hide the others. Run the script as a YARN admin "
+                    "account. YARN ACLs (yarn.acl.enable) hide the others. Run the script as a YARN admin "
                     "(yarn.admin.acl) to see all apps." % (reported, listed),
                     "  ",
                 ),
@@ -3523,11 +3664,17 @@ def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
         running = [a for a in group if a.get("state") == "RUNNING"]
         waiting = [a for a in group if a.get("state") == "ACCEPTED"]
         used = sum(to_float(a.get("allocatedMB")) or 0 for a in group if (to_float(a.get("allocatedMB")) or 0) > 0)
-        line = "Queue %s %s user %s: %d running, %d waiting" % (qpath, DOT, user, len(running), len(waiting))
+        line = "Queue %s %s service account %s: %d running, %d waiting" % (
+            qpath,
+            DOT,
+            user,
+            len(running),
+            len(waiting),
+        )
         if total:
             line += " %s uses %s of the cluster" % (DOT, pct(used / total))
             if q is not None and q.one_user_max is not None:
-                line += " (one-user limit %s)" % pct(q.one_user_max)
+                line += " (limit per account %s)" % pct(q.one_user_max)
         lq = q.live if q is not None else None
         if lq:
             users = (lq.get("users") or {}).get("user") or []
@@ -3538,12 +3685,23 @@ def print_apps(live: Live, queues: Dict[str, Queue]) -> None:
             am_lim = (lq.get("userAMResourceLimit") or {}).get("memory")
             if am_used is not None and am_lim:
                 line += " %s AM %s of %s" % (DOT, gb(am_used), gb(am_lim))
+        launchers = [a for a in running if is_launcher(a)]
+        if launchers:
+            one = len(launchers) == 1
+            line += " %s %d Oozie launcher%s hold%s %s (%s)" % (
+                DOT,
+                len(launchers),
+                "" if one else "s",
+                "s" if one else "",
+                gb(sum(max(0, to_float(a.get("allocatedMB")) or 0) for a in launchers)),
+                "an AM that waits for its Spark job" if one else "AMs that wait for their Spark jobs",
+            )
         at_limit = q is not None and q.one_user_max and total and used / total >= q.one_user_max * 0.95
         print(
             highlight(wrap(line, "  ", "    "))
             if not at_limit
-            else highlight(wrap(line + " %s AT ITS USER LIMIT" % DOT, "  ", "    ")).replace(
-                "AT ITS USER LIMIT", paint("AT ITS USER LIMIT", "PROBLEM")
+            else highlight(wrap(line + " %s AT ITS LIMIT" % DOT, "  ", "    ")).replace(
+                "AT ITS LIMIT", paint("AT ITS LIMIT", "PROBLEM")
             )
         )
 
@@ -3713,7 +3871,8 @@ SETTINGS = [
     ("cs", "AM pool of each queue (default)", "yarn.scheduler.capacity.maximum-am-resource-percent", "0.1", ""),
     ("cs", "Most apps (running + waiting)", "yarn.scheduler.capacity.maximum-applications", "10000", ""),
     ("cs", "Most running apps", "yarn.scheduler.capacity.max-parallel-apps", "", ""),
-    ("cs", "Most running apps per user", "yarn.scheduler.capacity.user.max-parallel-apps", "", ""),
+    ("cs", "Most running apps per service account", "yarn.scheduler.capacity.user.max-parallel-apps", "", ""),
+    ("cs", "Service accounts mapped to queues", "yarn.scheduler.capacity.queue-mappings", "", ""),
     ("spark", "Deploy mode", "spark.submit.deployMode", "client", ""),
     ("spark", "Queue", "spark.yarn.queue", "default", ""),
     ("spark", "Executor heap", "spark.executor.memory", "1g", ""),
@@ -3758,8 +3917,8 @@ QUEUE_SETTINGS = [
     ("Guaranteed share of the parent", "capacity", None, "%", False),
     ("Most share of the parent", "maximum-capacity", "100", "%", False),
     ("State", "state", "RUNNING", "", False),
-    ("One user: x guaranteed share", "user-limit-factor", "1", "", True),
-    ("Smallest share per active user", "minimum-user-limit-percent", "100", "%", True),
+    ("One service account: x guaranteed share", "user-limit-factor", "1", "", True),
+    ("Smallest share per active service account", "minimum-user-limit-percent", "100", "%", True),
     ("AM pool share", "maximum-am-resource-percent", None, "", True),
     ("Largest container: memory", "maximum-allocation-mb", None, " MB", True),
     ("Most running apps", "max-parallel-apps", None, "", True),
@@ -3805,6 +3964,15 @@ def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, 
             else:
                 value = "%s%s (default)" % (default, unit)
             rows.append((label, name, value))
+        if leaf:
+            mapped = [a for a, qn in queue_mappings(cs) if qn == path or path.endswith("." + qn)]
+            rows.append(
+                (
+                    "Service accounts mapped here",
+                    "yarn.scheduler.capacity.queue-mappings",
+                    ", ".join(mapped) if mapped else "none",
+                )
+            )
         blocks.append((path, leaf, rows))
     return blocks
 
@@ -4042,7 +4210,7 @@ def main() -> None:
         print_queue_cards(card_queues, queues, live, am, executor, files, launcher_size(files, min_alloc))
     if live:
         print_apps(live, queues)
-    print_containers(executor, am, deploy, files["spark"])
+    print_containers(executor, am, deploy, files["spark"], files["oozie"], launcher_size(files, min_alloc))
     if queues:
         print_queues(
             queues,
