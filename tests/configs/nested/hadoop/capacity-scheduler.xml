@@ -1,0 +1,23 @@
+<?xml version="1.0"?><configuration>
+<property><name>yarn.scheduler.capacity.maximum-am-resource-percent</name><value>0.5</value></property>
+<property><name>yarn.scheduler.capacity.root.queues</name><value>default,etl,analytics</value></property>
+<property><name>yarn.scheduler.capacity.root.default.capacity</name><value>40</value></property>
+<property><name>yarn.scheduler.capacity.root.default.user-limit-factor</name><value>5</value></property><property><name>yarn.scheduler.capacity.root.default.maximum-capacity</name><value>80</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.capacity</name><value>40</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.maximum-capacity</name><value>80</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.user-limit-factor</name><value>2</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.maximum-am-resource-percent</name><value>0.3</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.acl_submit_applications</name><value>etl_user</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.capacity</name><value>20</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.queues</name><value>adhoc,reports</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.adhoc.capacity</name><value>50</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.reports.capacity</name><value>50</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.reports.ordering-policy</name><value>fair</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.adhoc.queues</name><value>team_a,team_b,team_c</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.adhoc.team_a.capacity</name><value>50</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.adhoc.team_b.capacity</name><value>30</value></property>
+<property><name>yarn.scheduler.capacity.root.analytics.adhoc.team_c.capacity</name><value>10</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.queues</name><value>daily,hourly</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.daily.capacity</name><value>2w</value></property>
+<property><name>yarn.scheduler.capacity.root.etl.hourly.capacity</name><value>1w</value></property>
+</configuration>

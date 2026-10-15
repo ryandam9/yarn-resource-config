@@ -5,11 +5,15 @@ YARN or for the nodes, a full ApplicationMaster pool, Oozie launchers that block
 limits in a queue, or nodes without room. It reads the YARN, Capacity Scheduler, Spark and Oozie
 config files and, on Amazon EMR, the live state of the ResourceManager.
 
-The report starts with the findings. Each finding says what is wrong (or fine), what happens
-because of it, and what to do. Then come tables of what one Spark app asks for, the queues, the
-nodes and the settings behind the findings, and a short list of the terms used.
+The report answers first. The findings say what is wrong (or fine), what happens because of it,
+and what to do. Then a card for each queue that matters says whether a new job (an Oozie launcher
+plus its Spark ApplicationMaster) can start now, with the limits worked out as property → formula →
+value. Then come the apps, what one Spark app asks for, the queues, the nodes and the settings
+behind the findings, and a short list of the terms used.
 
-Background: [Why your Spark app gets no YARN resources](../docs/yarn_resources_explained_by_claude.html).
+It is one file, `yarn_spark_settings.py`, with no dependencies.
+
+Background: [Why your Spark app gets no YARN resources](https://github.com/ryandam9/Guides-2/blob/master/docs/yarn_resources_explained_by_claude.html).
 
 ## The script is read-only
 
@@ -32,6 +36,18 @@ Background: [Why your Spark app gets no YARN resources](../docs/yarn_resources_e
 | Read access to those files | Most are readable by any user on EMR. Some, such as `oozie-site.xml` or `/mnt/var/lib/info`, can be readable only by their service user. The script then lists them under **COULD NOT READ** and continues. Run it as the `hadoop` user (or with `sudo`) to include them. |
 | For live data: access to the ResourceManager | Port 8088 (8090 with `yarn.http.policy=HTTPS_ONLY`) on the primary node. The script does not use an HTTP proxy for these requests. |
 | For live data on a Kerberos cluster | Run `kinit` first, and have `curl` installed. If the plain request fails, the script retries with `curl --negotiate`. |
+
+## Get the script
+
+From a release (a fixed version), or from `main`:
+
+```bash
+curl -fsSLO https://github.com/ryandam9/yarn-resource-config/releases/latest/download/yarn_spark_settings.py
+curl -fsSLO https://raw.githubusercontent.com/ryandam9/yarn-resource-config/main/yarn_spark_settings.py
+```
+
+When the cluster cannot reach GitHub, copy the file to S3 from your machine and take it from there
+(see the EMR step below).
 
 ## Where to run it
 
@@ -611,10 +627,10 @@ longer fit its AM limit. EMR's own config otherwise.
 ```text
 YARN and Spark resource report
 ==============================
-Created:   2026-10-15 11:44 UTC
+Created:   2026-10-15 19:31 UTC
 Cluster:   j-TEST, emr-7.14.0 (master: 1 x m5.xlarge)
 This host: primary node
-Live data: from the ResourceManager at http://localhost:18510
+Live data: from the ResourceManager at http://ip-10-0-0-1:8088
 
 FINDINGS
 --------
@@ -941,7 +957,7 @@ and uses the one for all queues.
 
   Description                             Setting                                                           Value
 
-  /tmp/claude-0/-home-user-Guides/eae1401d-1472-53f4-9855-5dafc57d27d9/scratchpad/yarnt/hadoop/yarn-site.xml
+  /etc/hadoop/conf/yarn-site.xml
   Largest container: memory               yarn.scheduler.maximum-allocation-mb                              12288 MB
   Largest container: vcores               yarn.scheduler.maximum-allocation-vcores                          4 (default)
   Memory is rounded up to a multiple of   yarn.scheduler.minimum-allocation-mb                              32 MB
@@ -950,7 +966,7 @@ and uses the one for all queues.
   Node labels on                          yarn.node-labels.enabled                                          false (default)
   Node label for ApplicationMasters       yarn.node-labels.am.default-node-label-expression                 not set
 
-  /tmp/claude-0/-home-user-Guides/eae1401d-1472-53f4-9855-5dafc57d27d9/scratchpad/yarnt/hadoop/capacity-scheduler.xml
+  /etc/hadoop/conf/capacity-scheduler.xml
   Containers are sized by                 yarn.scheduler.capacity.resource-calculator                       memory only (default)
   AM pool of each queue (default)         yarn.scheduler.capacity.maximum-am-resource-percent               0.5 (50%)
   Most apps (running + waiting)           yarn.scheduler.capacity.maximum-applications                      10000 (default)
@@ -967,7 +983,7 @@ and uses the one for all queues.
   Largest container: memory               yarn.scheduler.capacity.root.default.maximum-allocation-mb        cluster limit (default)
   Most running apps                       yarn.scheduler.capacity.root.default.max-parallel-apps            no limit (default)
 
-  /tmp/claude-0/-home-user-Guides/eae1401d-1472-53f4-9855-5dafc57d27d9/scratchpad/yarnt/spark/spark-defaults.conf
+  /etc/spark/conf/spark-defaults.conf
   Deploy mode                             spark.submit.deployMode                                           client (default)
   Queue                                   spark.yarn.queue                                                  default (default)
   Executor heap                           spark.executor.memory                                             4743M
@@ -984,7 +1000,7 @@ and uses the one for all queues.
   Driver heap                             spark.driver.memory                                               2048M
   AM heap in client mode                  spark.yarn.am.memory                                              512m (default)
 
-  /tmp/claude-0/-home-user-Guides/eae1401d-1472-53f4-9855-5dafc57d27d9/scratchpad/yarnt/oozie/oozie-site.xml
+  /etc/oozie/conf/oozie-site.xml
   Launcher memory                         oozie.launcher.default.memory.mb                                  2048 MB (default)
   Launcher vcores                         oozie.launcher.default.vcores                                     1 (default)
   Launcher queue                          oozie.launcher.default.queue                                      default
@@ -1021,13 +1037,23 @@ keep running on Python 3.6, so the hints use the `typing` module (`List[str]`, n
 
 ```bash
 pip install ruff ty vermin
-ruff check scripts/yarn_spark_settings.py    # lint, and every function has type hints (ANN)
-ruff format scripts/yarn_spark_settings.py
+ruff check .                                 # lint, and every function has type hints (ANN)
+ruff format .
 ty check                                     # type check, against Python 3.7
-vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
+vermin --no-tips --violations -t=3.6- yarn_spark_settings.py tests
+python -m unittest discover -s tests -v      # the tests (standard library only)
 ```
 
-The `yarn-spark-settings` workflow runs the same checks on every pull request that changes the script.
+The tests run the report against a fake ResourceManager (`tests/fake_rm.py`, on a free local port)
+with the test configs in `tests/configs`: every config with every cluster state (apps waiting on the
+AM limit, nested queues, effective resources, an Oozie job that never fits, refused requests, a
+standby ResourceManager, ...) and the main options. They check that it never fails, that the
+report answers first, that memory is in GB, that ASCII terminals get only ASCII, that `--watch` stops
+cleanly on Ctrl-C and that unreadable files are reported. All names, hosts and IDs in them are made
+up. To look at one state by hand: `python tests/fake_rm.py dead 18088`, then run the script with
+`--rm http://127.0.0.1:18088`.
+
+The `ci` workflow runs the checks and the tests (Python 3.6, 3.8 and 3.12) on every pull request.
 
 ## Error messages
 

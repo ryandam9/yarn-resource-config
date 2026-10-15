@@ -1,0 +1,1 @@
+{"jobFlowId": "j-TEST", "instanceGroups": [{"instanceRole":"Master","instanceType":"m5.xlarge","requestedInstanceCount":1}]}

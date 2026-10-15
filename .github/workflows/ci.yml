@@ -1,18 +1,11 @@
-name: yarn-spark-settings
+name: ci
 
-# Lint, format and type checks for scripts/yarn_spark_settings.py (settings in pyproject.toml).
+# Lint, format and type checks, then the tests on the oldest and newest Pythons the script supports.
+# Settings in pyproject.toml.
 on:
   push:
-    branches: [master]
-    paths:
-      - "scripts/yarn_spark_settings.py"
-      - "pyproject.toml"
-      - ".github/workflows/yarn-spark-settings.yml"
+    branches: [main]
   pull_request:
-    paths:
-      - "scripts/yarn_spark_settings.py"
-      - "pyproject.toml"
-      - ".github/workflows/yarn-spark-settings.yml"
 
 permissions:
   contents: read
@@ -28,12 +21,36 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff==0.17.0 ty==0.0.88 vermin==1.8.0
       - name: ruff check
-        run: ruff check scripts/yarn_spark_settings.py
+        run: ruff check .
       - name: ruff format
-        run: ruff format --check scripts/yarn_spark_settings.py
+        run: ruff format --check .
       - name: ty (type check)
         run: ty check
       - name: still runs on Python 3.6
-        run: vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
-      - name: the report runs
-        run: python scripts/yarn_spark_settings.py --no-live --color never > /dev/null
+        run: vermin --no-tips --violations -t=3.6- yarn_spark_settings.py tests
+
+  test:
+    # 3.6 and 3.8 (old EMR images) run in containers; 3.12 runs on the runner as a normal user, so the
+    # test for files that cannot be read runs there (root in a container reads every file).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.6"
+            container: python:3.6-slim
+          - python: "3.8"
+            container: python:3.8-slim
+          - python: "3.12"
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: ${{ !matrix.container }}
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python --version
+      - name: tests
+        run: python -m unittest discover -s tests -v
