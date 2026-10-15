@@ -261,25 +261,26 @@ red):
 
 ### Queue card (`--queue NAME`)
 
-The answer for one queue, on one screen, in jobs rather than GB. It comes first in the report.
+The answer for one queue, on one screen. It comes first in the report.
 
-- **The answer:** ✓ how many more jobs can start and get executors now, or ✗ why a new job would wait,
-  or ! that it would start but get no executor.
-- **1. Room to START jobs:** every job first starts one job starter (its ApplicationMaster). The
-  AM limits (of the user and of the queue) decide how many can start. Each limit is a gauge, with
-  ✓ or ✗ and how many more job starters fit.
-- **2. Room to RUN jobs:** then the job needs executors, from the memory of the queue, the user's
-  share of it, the cluster and a node with room. A job that starts but gets no executor does
-  nothing; it only holds its job starter. That is why the card shows both budgets.
-- **3. How many jobs:** running now; more that can start and get executors now (the card starts
-  them one by one against both budgets and the free memory of each node); and, with the queue to
-  the user alone, how many jobs the AM limits allow and how many the memory can feed. When the AM
-  limits allow more jobs than memory can feed, the card warns: the extra jobs would start and sit
-  idle. Oozie workflows (launcher first) get their own line.
+- **The answer:** ✗ a new job would wait (and why), ! it would start but get no executor (and why),
+  or ✓ it can start now and get up to N executors right away.
+- **1. Job-starter (AM) limit, what is available:** every job first starts one job starter (its
+  ApplicationMaster). For the user's AM limit and the queue's AM pool: a gauge, the GB free and the
+  room for N more job starters. Their size is known, so this is a real count.
+- **2. Memory, what is available:** for the queue's maximum, the user's share of the queue and the
+  cluster: a gauge, the GB free and how many executors of the configured size that is; then the
+  largest free space on one node, and how many executors a new job can get right now (placed on the
+  real nodes, after its job starter).
+- **3. In short:** jobs running now, room for job starters, free memory. It also splits the user's
+  memory share over the most jobs its AM limit allows: when each job would get less than one
+  executor, the AM limit lets more jobs start than memory can feed. Oozie (launcher first) gets its
+  own line.
 - **4. What you can do:** numbered steps, with the setting and a suggested value where that helps.
 
-There is one card for each user with jobs in the queue (or one for a new user). The balance sheets
-with every number are still there with `--details`.
+The card does not say how many new jobs fit: each job asks for its own number of executors, so it
+shows what is free and what one executor needs. There is one card for each user with jobs in the
+queue (or one for a new user). The balance sheets with every number are there with `--details`.
 
 Example: the service account's job-starter limit is full, and there is no executor room either:
 
@@ -288,85 +289,80 @@ QUEUE root.default  ·  user svc_spark
 ─────────────────────────────────────
 
   ✗ A new Spark job would WAIT now (state ACCEPTED).
-    • Why: svc_spark already runs 3 jobs, and its job-starter limit has 0.00 GB left (2.62 GB of
-      2.62 GB used); one job starter needs 0.88 GB.
+    • Why: svc_spark already runs 3 jobs, and its job-starter limit has only 0.00 GB left; one job
+      starter needs 0.88 GB.
     ✗ And even if it could start, it would get no executor now: the queue has only 3.12 GB of memory
       left, and one executor needs 5.12 GB.
 
-  1. Room to START jobs
-    • Each job first starts one job starter (its ApplicationMaster, AM) of 0.88 GB.
-    ✗ svc_spark's job starters           [██████████] 100%  2.62 GB of 2.62 GB  room for 0 more
-    ✓ job starters of the whole queue    [███▊░░░░░░]  39%  4.62 GB of 12.00 GB  room for 8 more
+  1. Job-starter (AM) limit: what is available
+    • Every job first starts one job starter (its ApplicationMaster) of 0.88 GB.
+    ✗ svc_spark's job starters           [██████████] 100%  0.00 GB free of 2.62 GB  room for 0 more
+    ✓ job starters of the whole queue    [███▊░░░░░░]  39%  7.38 GB free of 12.00 GB  room for 8 more
 
-  2. Room to RUN jobs
-    • Then it needs executors to do the work: 5.12 GB each, at least 1 per job (dynamic allocation:
-      initial/min executors, at least 1).
-    • A job that starts but gets no executor does nothing; it only holds its job starter.
-    ✗ memory of the queue (its max)      [████████▋░]  87%  20.88 GB of 24.00 GB  3.12 GB left
-    ✓ svc_spark's share of the queue     [███████▊░░]  79%  18.88 GB of 24.00 GB  5.12 GB left
-    ✗ memory of the whole cluster        [████████▋░]  87%  20.88 GB of 24.00 GB  3.12 GB free
-    ✗ largest free space on one node                        1.87 GB (an executor needs 5.12 GB)
+  2. Memory: what is available
+    • Then a job needs executors to do the work: 5.12 GB each (spark-defaults.conf). A job that
+      starts but gets no executor does nothing.
+    ✗ memory of the queue (its max)      [████████▋░]  87%  3.12 GB free of 24.00 GB  = 0 executors
+    ✓ svc_spark's share of the queue     [███████▊░░]  79%  5.12 GB free of 24.00 GB  = 1 executor
+    ✗ memory of the whole cluster        [████████▋░]  87%  3.12 GB free of 24.00 GB  = 0 executors
+    ✗ largest free space on one node                        1.87 GB  (an executor needs 5.12 GB)
+    ✗ Executors a new job can get right now: 0 (placed on the real nodes, after its job starter).
 
-  3. How many jobs can svc_spark run at once here?
-    • Running now: 3.
-    ✗ More that can start AND get executors now: 0.
-    • With the queue to itself: the job-starter limits allow 3 jobs, the memory limits give
-      executors to 4.
-    • The job-starter limits are the bottleneck: memory could run 4 jobs.
+  3. In short
+    • svc_spark runs 3 jobs here now.
+    ✗ Job starters: room for 0 more.
+    ✗ Memory: 3.12 GB free for svc_spark in this queue, up to 0 executors for a new job now.
+    • If svc_spark ran 3 jobs (the most its job-starter limit allows), each would have about 7.12 GB
+      for executors (its share of the queue, 24.00 GB, split 3 ways).
     ✗ From Oozie: NEVER. Its launcher (2.00 GB) and the job starter (0.88 GB) together are more than
       svc_spark's job-starter limit (2.62 GB).
 
   4. What you can do
-    1. Wait: when one of svc_spark's jobs ends, one new job can start.
+    1. Wait: when one of svc_spark's jobs ends, its job starter frees up.
     2. Let svc_spark start more jobs: yarn.scheduler.capacity.root.default.user-limit-factor 1 ->
-       1.4 gives a job-starter limit of about 3.67 GB, room for about 1 more. It also raises
-       svc_spark's share of the queue. The new jobs still need executor room (see 2).
+       1.7 gives a job-starter limit of about 4.46 GB (room for about 2 more). It also raises
+       svc_spark's share of the queue.
     3. Wait until other containers end. For more room for good, add nodes to the cluster.
     4. For Oozie: give the launchers their own queue (oozie.launcher.default.queue).
 
   All numbers in detail (the balance sheet): run again with --details.
 ```
 
-Example: a job would start, but the free memory is spread over the nodes in pieces too small for an
-executor, and the AM limit allows more jobs than memory can feed:
+Example: a job can start and get 2 executors now:
 
 ```
 QUEUE root.default  ·  user svc_spark
 ─────────────────────────────────────
 
-  ! A new Spark job would START, but get no executor now, so it would do nothing.
-    • Why: after its own job starter, the most free on one node is 5.00 GB, and one executor needs
-      5.12 GB.
+  ✓ A new Spark job can START now and get up to 2 executors (5.12 GB each) right away.
+    • More than that: as memory frees up (after its own job starter, svc_spark's share of the queue
+      has only 2.88 GB left, and one executor needs 5.12 GB).
 
-  1. Room to START jobs
-    • Each job first starts one job starter (its ApplicationMaster, AM) of 0.88 GB.
-    ✓ svc_spark's job starters           [█▍░░░░░░░░]  15%  0.88 GB of 6.00 GB  room for 5 more
-    ✓ job starters of the whole queue    [▋░░░░░░░░░]   7%  0.88 GB of 12.00 GB  room for 12 more
+  1. Job-starter (AM) limit: what is available
+    • Every job first starts one job starter (its ApplicationMaster) of 0.88 GB.
+    ✓ svc_spark's job starters           [███▎░░░░░░]  33%  1.75 GB free of 2.62 GB  room for 2 more
+    ✓ job starters of the whole queue    [▋░░░░░░░░░]   7%  11.12 GB free of 12.00 GB  room for 12 more
 
-  2. Room to RUN jobs
-    • Then it needs executors to do the work: 5.12 GB each, at least 1 per job (dynamic allocation:
-      initial/min executors, at least 1).
-    • A job that starts but gets no executor does nothing; it only holds its job starter.
-    ✓ memory of the queue (its max)      [█████▊░░░░]  58%  14.00 GB of 24.00 GB  10.00 GB left
-    ✓ svc_spark's share of the queue     [█████▊░░░░]  58%  14.00 GB of 24.00 GB  10.00 GB left
-    ✓ memory of the whole cluster        [█████▊░░░░]  58%  14.00 GB of 24.00 GB  10.00 GB free
-    ✗ largest free space on one node                        5.00 GB (an executor needs 5.12 GB)
+  2. Memory: what is available
+    • Then a job needs executors to do the work: 5.12 GB each (spark-defaults.conf). A job that
+      starts but gets no executor does nothing.
+    ✓ memory of the queue (its max)      [██▋░░░░░░░]  27%  16.00 GB free of 22.00 GB  = 3 executors
+    ✓ svc_spark's share of the queue     [███░░░░░░░]  30%  14.00 GB free of 20.00 GB  = 2 executors
+    ✓ memory of the whole cluster        [██▌░░░░░░░]  25%  18.00 GB free of 24.00 GB  = 3 executors
+    ✓ largest free space on one node                        9.00 GB  (an executor needs 5.12 GB)
+    ✓ Executors a new job can get right now: 2 (placed on the real nodes, after its job starter).
 
-  3. How many jobs can svc_spark run at once here?
-    • Running now: 1.
-    ✗ More that can start AND get executors now: 0.
-    ✗ More that can only start, without executors: 5 (they would sit idle).
-    • With the queue to itself: the job-starter limits allow 6 jobs, the memory limits give
-      executors to 4.
-    ✗ The job-starter limits allow more jobs than memory can feed: the extra jobs would start and
-      sit idle, holding memory. A lower maximum-am-resource-percent avoids that.
-    ✗ From Oozie (a launcher of 2.00 GB first, in the same queue): 0 more can start and run now:
-      after its launcher and job starter, the most free on one node is 4.12 GB, and one executor
-      needs 5.12 GB.
+  3. In short
+    • svc_spark runs 1 job here now.
+    ✓ Job starters: room for 2 more.
+    ✓ Memory: 14.00 GB free for svc_spark in this queue, up to 2 executors for a new job now.
+    • If svc_spark ran 3 jobs (the most its job-starter limit allows), each would have about 5.79 GB
+      for executors (its share of the queue, 20.00 GB, split 3 ways).
+    ✗ From Oozie: NEVER. Its launcher (2.00 GB) and the job starter (0.88 GB) together are more than
+      svc_spark's job-starter limit (2.62 GB).
 
   4. What you can do
-    1. Wait until other containers end. For more room for good, add nodes to the cluster.
-    2. Or use smaller executors (spark.executor.memory), so they fit in the free space on a node.
+    1. For Oozie: give the launchers their own queue (oozie.launcher.default.queue).
 
   All numbers in detail (the balance sheet): run again with --details.
 ```
