@@ -263,22 +263,27 @@ red):
 
 The answer for one queue, on one screen. It comes first in the report.
 
-- **The answer:** ✗ a new Spark job would wait (and why), ! it would start but no memory is left,
-  or ✓ it can start now; with the memory available to the user now.
-- **1. AM limit of the user** and **2. AM limit of the whole queue:** every Spark job first starts
-  one ApplicationMaster (AM). Each block lists, in aligned columns, *what*, *the formula with the
-  property names and live values*, and *the result*: the default AM size, each factor of the limit,
-  the limit by the formula and YARN's own figure (the one that counts), the AM memory in use, what is
-  free, and how many new AMs of the default size fit.
+When `oozie-site.xml` is found and the Oozie launchers run in this queue, the card treats a Spark
+job from Oozie as the normal case: its launcher is an ApplicationMaster (AM) too, so one Oozie job
+needs the launcher (`oozie.launcher.default.memory.mb`) plus the Spark AM from the AM limits.
+
+- **The answer:** ✗ a new job would wait (or can never start, when one Oozie job needs more than
+  the whole AM limit of the user), ! it would start but no memory is left for executors, or ✓ it
+  can start, with the memory left for its executors.
+- **1. AM limit of the user** and **2. AM limit of the whole queue**, in aligned columns of
+  *what*, *the formula with property names and live values*, and *the result*: the launcher and
+  Spark AM sizes, each factor of the limit, the limit by the formula and YARN's own figure (the one
+  that counts), the AM memory in use, what is free, and how many new Oozie jobs and new
+  spark-submit jobs fit.
 - **3. Memory available to the user:** the queue max, what the queue uses and what is free; the
   user's share, what the user uses and what is free; what is free in the cluster; the smallest of
-  these (what the user can get now); and the largest free space on one node.
-- **Notes** (the user's memory share split over the most jobs its AM limit allows; Oozie launchers)
-  and **What you can do**, with the setting and a suggested value.
+  these; what is left for executors after a new job's AMs; and the largest free space on one node.
+- **Notes** and **What you can do**, with the setting and a value worked out from the numbers:
+  raise `user-limit-factor` or `maximum-am-resource-percent`, or give the launchers less memory.
 
-The card does not count executors or jobs: each job sets its own executor number and size, so the
-card shows what is free. There is one card for each user with jobs in the queue (or one for a new
-user). The balance sheets with every number are there with `--details`.
+The card does not count executors: each job sets its own executor number and size. There is one
+card for each user with jobs in the queue (or one for a new user). The balance sheets with every
+number are there with `--details`.
 
 Example (test data; on a test cluster YARN's figures need not match the formulas):
 
@@ -286,12 +291,78 @@ Example (test data; on a test cluster YARN's figures need not match the formulas
 QUEUE root.default  ·  user svc_spark
 ─────────────────────────────────────
 
-  ✗ A new Spark job would WAIT now (state ACCEPTED).
-    • Why: svc_spark already runs 3 jobs, and its AM limit has 0.00 GB free; a new AM needs 0.88 GB.
-    • Memory available to svc_spark now: 3.12 GB (free in the queue).
+  ✓ A new Spark job from Oozie can START now.
+    • Memory left for its executors: 7.92 GB (available 10.80 GB, minus 2.88 GB for the launcher and
+      Spark AM).
+    • The largest free space on one node: 9.00 GB.
 
-  1. AM limit of svc_spark   ✗ full: no room for a new AM
-      Default AM size           spark.yarn.am.memory 512 MB + overhead 384 MB           =    0.88 GB
+  1. AM limit of svc_spark   ✓ room for 1 new Oozie job
+      Oozie launcher (an AM)    oozie.launcher.default.memory.mb                        =    2.00 GB
+      Spark AM                  spark.yarn.am.memory 512 MB + overhead 384 MB           =    0.88 GB
+      One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
+      Guaranteed capacity       the queue's capacity, as a share of the cluster         =   16.80 GB
+      AM percent                maximum-am-resource-percent                             =        50%
+      User limit factor         user-limit-factor                                       =          1
+      User share                the larger of minimum-user-limit-percent 100% and 1 / 1 =       100%
+                                active user
+      Limit by the formula      16.80 GB × 50% × 1 × 100%                               =    8.40 GB
+      Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    6.00 GB
+                                counts
+      Used                      the AMs of svc_spark's 1 running app (launchers and     =    0.88 GB
+                                Spark AMs)
+    ✓ Free                      6.00 GB - 0.88 GB                                       =    5.12 GB
+    ✓ New Oozie jobs that fit   5.12 GB / 2.88 GB (launcher + Spark AM)                 =          1
+    ✓ New spark-submit jobs     5.12 GB / 0.88 GB (Spark AM only)                       =          5
+
+  2. AM limit of the whole queue   ✓ room for 3 new Oozie jobs
+      AM percent                maximum-am-resource-percent                             =        50%
+      Guaranteed capacity       the queue's capacity, as a share of the cluster         =   16.80 GB
+      Limit by the formula      50% × 16.80 GB (YARN may use more when the queue uses   =    8.40 GB
+                                more, up to its max)
+      Limit (YARN's figure)     AMResourceLimit, from the ResourceManager: this one     =   12.00 GB
+                                counts
+      Used                      4 running AMs (svc_spark 0.88 GB)                       =    0.88 GB
+    ✓ Free                      12.00 GB - 0.88 GB                                      =   11.12 GB
+    ✓ New Oozie jobs that fit   11.12 GB / 2.88 GB (launcher + Spark AM)                =          3
+    ✓ New spark-submit jobs     11.12 GB / 0.88 GB (Spark AM only)                      =         12
+
+  3. Memory available to svc_spark   ✓ 10.80 GB free now
+      Queue max                   maximum-capacity 100% × cluster 24.00 GB              =   24.00 GB
+      Used by the queue           all running containers in root.default                =    6.00 GB
+    ✓ Free in the queue           24.00 GB - 6.00 GB                                    =   18.00 GB
+      svc_spark's share           user-limit-factor 1 × guaranteed 16.80 GB, at most    =   16.80 GB
+                                  the queue max
+      Used by svc_spark           its 1 running app                                     =    6.00 GB
+    ✓ Free in svc_spark's share   16.80 GB - 6.00 GB                                    =   10.80 GB
+    ✓ Free in the cluster         memory that no container uses (of 24.00 GB)           =   18.00 GB
+    ✓ Available to svc_spark now  the smallest of the free amounts above (free in       =   10.80 GB
+                                  svc_spark's share)
+    ✓ Left for executors          10.80 GB - 2.88 GB (launcher + Spark AM of a new      =    7.92 GB
+                                  Oozie job)
+      Largest free on one node    a container (AM or executor) must fit on one node     =    9.00 GB
+
+  Notes
+    • If svc_spark ran 2 Oozie jobs (the most its AM limit allows), each would have about 5.52 GB of
+      memory for executors (its share 16.80 GB, split 2 ways, minus the AMs).
+
+  All numbers in detail (the balance sheet): run again with --details.
+```
+
+Example: one Oozie job needs more than the user's whole AM limit:
+
+```
+QUEUE root.default  ·  user svc_spark
+─────────────────────────────────────
+
+  ✗ A new Spark job from Oozie can NEVER start here now.
+    • Why: svc_spark's AM limit is 2.62 GB in all, and a new Oozie job needs 2.88 GB (launcher 2.00
+      GB + Spark AM 0.88 GB).
+    • The launcher starts, and the Spark AM then waits for good. See What you can do.
+
+  1. AM limit of svc_spark   ✗ NEVER fits an Oozie job: the whole limit is 2.62 GB
+      Oozie launcher (an AM)    oozie.launcher.default.memory.mb                        =    2.00 GB
+      Spark AM                  spark.yarn.am.memory 512 MB + overhead 384 MB           =    0.88 GB
+      One Oozie job needs       launcher 2.00 GB + Spark AM 0.88 GB                     =    2.88 GB
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
       AM percent                maximum-am-resource-percent                             =        50%
       User limit factor         user-limit-factor                                       =          1
@@ -301,11 +372,13 @@ QUEUE root.default  ·  user svc_spark
                                 limit)
       Limit (YARN's figure)     userAMResourceLimit, from the ResourceManager: this one =    2.62 GB
                                 counts
-      Used                      3 running AMs of svc_spark                              =    2.62 GB
+      Used                      the AMs of svc_spark's 3 running apps (launchers and    =    2.62 GB
+                                Spark AMs)
     ✗ Free                      2.62 GB - 2.62 GB                                       =    0.00 GB
-    ✗ New AMs that fit          0.00 GB / 0.88 GB (default AM size)                     =          0
+    ✗ New Oozie jobs that fit   0.00 GB / 2.88 GB (launcher + Spark AM)                 =          0
+    ✗ New spark-submit jobs     0.00 GB / 0.88 GB (Spark AM only)                       =          0
 
-  2. AM limit of the whole queue   ✓ room for 8 new AMs
+  2. AM limit of the whole queue   ✓ room for 2 new Oozie jobs
       AM percent                maximum-am-resource-percent                             =        50%
       Guaranteed capacity       the queue's capacity, as a share of the cluster         =   24.00 GB
       Limit by the formula      50% × 24.00 GB (YARN may use more when the queue uses   =   12.00 GB
@@ -314,8 +387,9 @@ QUEUE root.default  ·  user svc_spark
                                 counts
       Used                      4 running AMs (svc_spark 2.62 GB, hadoop 2.00 GB)       =    4.62 GB
     ✓ Free                      12.00 GB - 4.62 GB                                      =    7.38 GB
-    ✓ New AMs that fit          7.38 GB / 0.88 GB (default AM size)                     =          8
-      • svc_spark cannot use this room: its own AM limit (block 1) is full.
+    ✓ New Oozie jobs that fit   7.38 GB / 2.88 GB (launcher + Spark AM)                 =          2
+    ✓ New spark-submit jobs     7.38 GB / 0.88 GB (Spark AM only)                       =          8
+      • svc_spark cannot use this room: its own AM limit (block 1) is the one that is short.
 
   3. Memory available to svc_spark   ✓ 3.12 GB free now
       Queue max                   maximum-capacity 100% × cluster 24.00 GB              =   24.00 GB
@@ -323,25 +397,22 @@ QUEUE root.default  ·  user svc_spark
     ✓ Free in the queue           24.00 GB - 20.88 GB                                   =    3.12 GB
       svc_spark's share           user-limit-factor 1 × guaranteed 24.00 GB, at most    =   24.00 GB
                                   the queue max
-      Used by svc_spark           its 3 running jobs                                    =   18.88 GB
+      Used by svc_spark           its 3 running apps                                    =   18.88 GB
     ✓ Free in svc_spark's share   24.00 GB - 18.88 GB                                   =    5.12 GB
     ✓ Free in the cluster         memory that no container uses (of 24.00 GB)           =    3.12 GB
     ✓ Available to svc_spark now  the smallest of the free amounts above (free in the   =    3.12 GB
                                   queue)
+    ✓ Left for executors          3.12 GB - 2.88 GB (launcher + Spark AM of a new Oozie =    0.25 GB
+                                  job)
       Largest free on one node    a container (AM or executor) must fit on one node     =    1.87 GB
 
-  Notes
-    • If svc_spark ran 3 jobs (the most its AM limit allows), each would have about 7.12 GB of
-      memory (its share 24.00 GB, split 3 ways, minus the AMs).
-    ✗ From Oozie: NEVER. Its launcher (2.00 GB) and the AM (0.88 GB) together are more than
-      svc_spark's AM limit (2.62 GB).
-
   What you can do
-    1. Wait: when one of svc_spark's jobs ends, its AM frees up.
-    2. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 1.7: svc_spark's AM limit
-       becomes about 4.46 GB (room for about 2 new AMs). It also raises svc_spark's share of the
+    1. Raise yarn.scheduler.capacity.root.default.user-limit-factor 1 -> 2.1: svc_spark's AM limit
+       becomes about 5.51 GB, room for 1 more Oozie job. It also raises svc_spark's share of the
        queue.
-    3. For Oozie: give the launchers their own queue (oozie.launcher.default.queue).
+    2. Or give the launchers less memory: oozie.launcher.default.memory.mb 2048 -> 1792 (in
+       oozie-site.xml, or oozie.launcher.memory.mb in one workflow action). A launcher only waits
+       for its Spark job, so it rarely needs 2 GB.
 
   All numbers in detail (the balance sheet): run again with --details.
 ```
@@ -688,14 +759,14 @@ TERMS
 
 ## Checks (for changes to the script)
 
-The script has type hints and is checked with ruff and mypy (settings in `pyproject.toml`). It
-must keep running on Python 3.6, so the hints use the `typing` module (`List[str]`, not `list[str]`).
+The script has type hints and is checked with ruff and ty (settings in `pyproject.toml`). It must
+keep running on Python 3.6, so the hints use the `typing` module (`List[str]`, not `list[str]`).
 
 ```bash
-pip install ruff mypy vermin
-ruff check scripts/yarn_spark_settings.py
+pip install ruff ty vermin
+ruff check scripts/yarn_spark_settings.py    # lint, and every function has type hints (ANN)
 ruff format scripts/yarn_spark_settings.py
-mypy                                   # strict
+ty check                                     # type check, against Python 3.7
 vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
 ```
 

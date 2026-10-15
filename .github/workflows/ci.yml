@@ -26,13 +26,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff==0.17.0 mypy==2.4.0 vermin==1.8.0
+      - run: pip install ruff==0.17.0 ty==0.0.88 vermin==1.8.0
       - name: ruff check
         run: ruff check scripts/yarn_spark_settings.py
       - name: ruff format
         run: ruff format --check scripts/yarn_spark_settings.py
-      - name: mypy (strict)
-        run: mypy
+      - name: ty (type check)
+        run: ty check
       - name: still runs on Python 3.6
         run: vermin --no-tips --violations -t=3.6- scripts/yarn_spark_settings.py
       - name: the report runs
