@@ -150,6 +150,27 @@ class Report(unittest.TestCase):
         joined = re.sub(r"\s+", " ", out)  # wrapped lines joined
         self.assertIn("1 Oozie launcher holds 2.00 GB (an AM that waits for its Spark job)", joined)  # Apps
 
+    def test_account_and_group(self) -> None:
+        # The service account or group comes from the command line, as given: no lookup of group members.
+        rc, out = run("default", self.servers["ok"], ["--queue", "default", "--account", "svc_reports", "--details"])
+        self.check(rc, out)
+        cards = re.findall(r"\nQUEUE .*", out)
+        self.assertEqual(cards, ["\nQUEUE root.default  \u00b7  service account svc_reports (no jobs now)"])
+        self.assertIn("As service account svc_reports, with spark-submit:", out)
+        self.assertNotIn("As service account svc_spark", out)
+        rc, out = run("default", self.servers["ok"], ["--queue", "default", "--group", "analysts", "--color", "never"])
+        self.check(rc, out)
+        self.assertIn("QUEUE root.default  \u00b7  group analysts: one of its accounts, with no jobs now", out)
+        self.assertIn("AM limit of one analysts account", out)
+        rc, out = run("default", self.servers["ok"], ["--account", "svc_reports"])
+        self.assertEqual(rc, 2)  # needs --queue
+        self.assertIn("--account and --group need --queue", out)
+        rc, out = run("queues", None, ["--color", "never"])  # g:analysts:analytics in the settings
+        self.check(rc, out)
+        self.assertRegex(
+            out, r"Service accounts mapped here +yarn\.scheduler\.capacity\.queue-mappings +group analysts"
+        )
+
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])
         self.check(rc, out)

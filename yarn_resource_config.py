@@ -17,6 +17,8 @@ Run it on the primary node of an Amazon EMR cluster (or on a Hadoop edge node):
     python3 yarn_resource_config.py --watch 30   # queues and apps, redrawn every 30 s (like yarn top)
     python3 yarn_resource_config.py --queue etl  # cards for queue etl only: can a new job start there?
     python3 yarn_resource_config.py --details    # also the balance sheets behind the cards
+    python3 yarn_resource_config.py --queue etl --account svc_etl  # one service account in queue etl
+    python3 yarn_resource_config.py --queue etl --group analysts   # one account of a group mapped to etl
 
 The script needs Python 3.6 or later (EMR 6 and 7 have it) and uses only the standard library.
 
@@ -699,6 +701,7 @@ class Queue:
         self.ordering: Optional[str] = None  # ordering-policy: fifo (default) or fair
         self.live: Optional[Json] = None  # the queue from the REST API
         self.accounts: List[str] = []  # service accounts mapped to this queue (queue-mappings)
+        self.chosen: Optional[List[str]] = None  # the accounts named with --account / --group, if any
 
     @property
     def one_user_max(self) -> Optional[float]:
@@ -775,20 +778,22 @@ def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
     return queues
 
 
-def queue_mappings(cs: ConfigFile) -> List[Tuple[str, str]]:
-    """The service accounts that yarn.scheduler.capacity.queue-mappings sends to a queue: [(account, queue)].
-    Only u:<account>:<queue> entries with fixed names; group (g:) and %user rules name no account."""
+def queue_mappings(cs: ConfigFile, kind: str = "u") -> List[Tuple[str, str]]:
+    """The entries of yarn.scheduler.capacity.queue-mappings with fixed names: [(name, queue)]. kind "u" gives
+    service accounts (u:<account>:<queue>), "g" groups (g:<group>:<queue>); %user rules name nobody."""
     out: List[Tuple[str, str]] = []
     for entry in cs.get("yarn.scheduler.capacity.queue-mappings", "").split(","):
         parts = [p.strip() for p in entry.split(":")]
-        if len(parts) == 3 and parts[0] == "u" and parts[1] and parts[2] and "%" not in parts[1] + parts[2]:
+        if len(parts) == 3 and parts[0] == kind and parts[1] and parts[2] and "%" not in parts[1] + parts[2]:
             out.append((parts[1], parts[2]))
     return out
 
 
 def queue_accounts(q: Queue, live: Optional[Live]) -> List[str]:
-    """The service accounts of a queue: those with apps in it now (busiest first), then the ones mapped
-    to it in queue-mappings."""
+    """The service accounts of a queue: the ones named with --account / --group, or else those with apps in
+    it now (busiest first), then the ones mapped to it in queue-mappings."""
+    if q.chosen is not None:
+        return q.chosen
     used: Dict[str, float] = {}
     for a in (live or {}).get("apps") or []:
         if a.get("state") in ("RUNNING", "ACCEPTED") and find_queue({q.path: q}, str(a.get("queue", ""))) is q:
@@ -1875,7 +1880,12 @@ def queue_balance(q: Queue, live: Live, am_size: int, executor_size: int) -> Opt
 NEW_USER = "a service account with no jobs here"  # YARN calls a service account a user
 
 
+GROUP = "group:"  # a group named with --group: the numbers are those of one of its accounts without jobs
+
+
 def who(user: User) -> str:
+    if user["name"].startswith(GROUP):
+        return "one account of group " + user["name"][len(GROUP) :]
     return user["name"] if user["name"] == NEW_USER else "service account " + user["name"]
 
 
@@ -1885,7 +1895,9 @@ def cap(text: str) -> str:
 
 
 def account(user: User) -> str:
-    """The service account's name, or a plain description when it has no name."""
+    """The service account's name, or "one <group> account" for a group named with --group."""
+    if user["name"].startswith(GROUP):
+        return "one %s account" % user["name"][len(GROUP) :]
     return user["name"]
 
 
@@ -2468,6 +2480,8 @@ def print_balance(
         users += [u for u in oozie[0]["users"] if all(u["name"] != w["name"] for w in users)]
     # and the service accounts mapped to the queue (queue-mappings) that have no apps now
     users += [user_in(b, n) for n in b["q"].accounts if all(n != w["name"] for w in users)]
+    if b["q"].chosen is not None:  # named with --account / --group: only those
+        users = [user_in(b, n) for n in b["q"].chosen]
     users = users or [None]
     seen: Set[str] = set()
     for user in users:
@@ -2676,7 +2690,7 @@ def queue_summary(b: Balance, user: User, am: float, launcher: float) -> Dict[st
         "kind": kind,
         "text": text,
         "need": need,
-        "who": "none mapped" if user["name"] == NEW_USER else user["name"],
+        "who": "none mapped" if user["name"] == NEW_USER else account(user),
     }
 
 
@@ -2947,8 +2961,10 @@ def print_queue_card(
 ) -> None:
     q = b["q"]
     am = float(b["am_size"])
-    name = user["name"]
-    if user["name"] == NEW_USER:
+    name = account(user)
+    if user["name"].startswith(GROUP):
+        who_text = "group %s: one of its accounts, with no jobs now" % user["name"][len(GROUP) :]
+    elif user["name"] == NEW_USER:
         who_text = "no service account has jobs here or is mapped here"
     elif user["apps"] or user["waiting"] or user["used"]:
         who_text = "service account " + name
@@ -2958,6 +2974,16 @@ def print_queue_card(
     print()
     print(paint(title, "section"))
     print(paint(BOX["line"] * len(title), "rule"))
+    if user["name"].startswith(GROUP):
+        print()
+        bullets(
+            [
+                "YARN's limits are per service account, not per group, so this card shows one account of the "
+                "group that has no jobs now. An account that already runs jobs has less free: give it with "
+                "--account to see its own numbers."
+            ],
+            "  ",
+        )
 
     # An Oozie Spark job first starts its launcher, an AM of its own, then the Spark AM. When the
     # launcher runs in this queue, both count against the AM limits here.
@@ -3966,6 +3992,7 @@ def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, 
             rows.append((label, name, value))
         if leaf:
             mapped = [a for a, qn in queue_mappings(cs) if qn == path or path.endswith("." + qn)]
+            mapped += ["group " + g for g, qn in queue_mappings(cs, "g") if qn == path or path.endswith("." + qn)]
             rows.append(
                 (
                     "Service accounts mapped here",
@@ -4150,6 +4177,19 @@ def main() -> None:
         "once for more queues. Needs live data",
     )
     ap.add_argument(
+        "--account",
+        action="append",
+        metavar="NAME",
+        help="with --queue: show the cards and rows of this service account only (more than once for more)",
+    )
+    ap.add_argument(
+        "--group",
+        action="append",
+        metavar="NAME",
+        help="with --queue: a group of service accounts (as in a g:<group>:<queue> mapping); its card shows "
+        "the numbers of one of its accounts with no jobs now, since YARN's limits are per account",
+    )
+    ap.add_argument(
         "--details",
         action="store_true",
         help="also print the balance sheets: every number behind the queue cards, worked out step by step "
@@ -4168,6 +4208,8 @@ def main() -> None:
         ap.error("--watch needs 2 seconds or more")
     if args.watch is not None and args.live is False:
         ap.error("--watch needs live data; remove --no-live")
+    if (args.account or args.group) and not args.queue:
+        ap.error("--account and --group need --queue: the queue the service account or group is mapped to")
 
     files = {
         "yarn": ConfigFile("yarn", os.path.join(args.hadoop_conf, "yarn-site.xml"), "yarn-site.xml"),
@@ -4192,6 +4234,12 @@ def main() -> None:
     live, live_errors = fetch_live(rm_urls(files["yarn"], args.rm)) if live_wanted else (None, [])
 
     queues = build_queues(files["cs"], live)
+    if args.account or args.group:  # the accounts to check, as given: no lookup of who is in a group
+        chosen = list(args.account or []) + [GROUP + g for g in args.group or []]
+        for name in args.queue:
+            q = find_queue(queues, name)
+            if q is not None:
+                q.chosen = chosen
     min_alloc = to_float(files["yarn"].get("yarn.scheduler.minimum-allocation-mb", "1024")) or 1024
     executor, am, deploy = spark_containers(files["spark"], min_alloc)
     findings = find_problems(files, queues, live, executor, am)
