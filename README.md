@@ -23,7 +23,13 @@ limits per service account (YARN calls it a *user*: `user-limit-factor`, `userAM
 so all jobs of one service account share them. The report names the service accounts: one card and
 one row in **Queues now** for each service account of a queue, those with jobs in it now first,
 then those mapped to it that have no jobs now. The Settings list the accounts mapped to each queue.
-Mappings by group (`g:`) or with `%user` name no account, so they are not shown.
+Mappings by group (`g:`) name no account: the Settings show the group, and the script does not
+look up who is in it. Name the account or group yourself:
+
+```bash
+python3 yarn_resource_config.py --queue etl --account svc_etl     # this service account in queue etl
+python3 yarn_resource_config.py --queue etl --group analysts      # one account of group analysts
+```
 
 ## The script is read-only
 
@@ -161,6 +167,8 @@ For a quick live view without the rest of the report, Hadoop's own `yarn top` al
 | `--all` | Also list every property that the Settings table does not show, so every property in the files appears in the report (secret values hidden). |
 | `--color auto\|always\|never` | Colour the report. `auto` (the default) colours it only on a terminal, so files, pipes and EMR step logs stay plain text. `NO_COLOR=1` turns colour off. |
 | `--queue NAME` | Show the **queue card** (can a new job start now, and if not, why; see below) for this queue instead of the default cards. Give it more than once for more queues. Needs live data. |
+| `--account NAME` | With `--queue`: show the cards, rows and balance sheets of this service account only. Give it more than once for more accounts. |
+| `--group NAME` | With `--queue`: a group of service accounts, as in a `g:<group>:<queue>` mapping. YARN's limits are per account, so the card shows one account of the group that has no jobs now; give an account that runs jobs with `--account` to see its own numbers. The script does not look up who is in the group. |
 | `--details` | Also print the balance sheets (every number behind the queue cards, step by step). With `--queue`, only for those queues. |
 | `--watch SECONDS` | Show only the Queues, the **Queues now** table (one line per queue: AM free, memory free, can a new job start) and the Apps, redrawn every SECONDS (2 or more), like `yarn top`. Needs live data. Ctrl-C stops it. |
 | `--hadoop-conf DIR` | Directory with `yarn-site.xml` and `capacity-scheduler.xml`. Default: `$HADOOP_CONF_DIR`, `$YARN_CONF_DIR`, then `/etc/hadoop/conf`. |
@@ -646,7 +654,7 @@ longer fit its AM limit. EMR's own config otherwise.
 ```text
 YARN and Spark resource report
 ==============================
-Created:   2026-10-15 20:43 UTC
+Created:   2026-10-16 04:36 UTC
 Cluster:   j-TEST, emr-7.14.0 (master: 1 x m5.xlarge)
 This host: primary node
 Live data: from the ResourceManager at http://ip-10-0-0-1:8088
