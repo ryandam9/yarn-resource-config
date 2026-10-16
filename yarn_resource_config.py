@@ -4133,74 +4133,147 @@ def print_header(
 # ================================================================== main
 
 
+HELP_DESCRIPTION = """\
+Says why a Spark job on YARN waits or gets no resources, and what to change.
+Read-only: it reads the config files and the ResourceManager, and changes nothing.
+Run it on the EMR primary node. Python 3.6 or later, no other packages."""
+
+HELP_EXAMPLES = """\
+examples (run on the EMR primary node):
+
+  Is anything wrong? Start here: findings, a card per queue that matters, apps, queues, settings
+    python3 yarn_resource_config.py
+
+  Can a new job start in queue etl?
+    python3 yarn_resource_config.py --queue etl
+
+  ... for service account svc_etl (mapped to etl)?
+    python3 yarn_resource_config.py --queue etl --account svc_etl
+
+  ... for two service accounts of that queue?
+    python3 yarn_resource_config.py --queue etl --account svc_a --account svc_b
+
+  ... for any account of group analysts (a g:analysts:etl mapping)?
+    python3 yarn_resource_config.py --queue etl --group analysts
+
+  Several queues at once
+    python3 yarn_resource_config.py --queue etl --queue default
+
+  Every number behind the answer (balance sheets)
+    python3 yarn_resource_config.py --queue etl --account svc_etl --details
+
+  Watch the queues and apps, every 30 seconds (Ctrl-C stops)
+    python3 yarn_resource_config.py --watch 30
+
+  Only the config files, no ResourceManager
+    python3 yarn_resource_config.py --no-live
+
+  ResourceManager on another host, or not on EMR
+    python3 yarn_resource_config.py --live --rm http://<resourcemanager-host>:8088
+
+  Config files in other directories
+    python3 yarn_resource_config.py --hadoop-conf DIR --spark-conf DIR --oozie-conf DIR
+
+  Every property in the files too
+    python3 yarn_resource_config.py --all
+
+  Save the report to a file (no colour codes)
+    python3 yarn_resource_config.py --queue etl --color never > report.txt
+
+  Get the newest version
+    curl -fsSLO https://github.com/ryandam9/yarn-resource-config/releases/latest/download/yarn_resource_config.py
+
+  Run as an EMR step, without SSH (the output goes to the step's stdout log; one line to copy)
+    aws s3 cp yarn_resource_config.py s3://<bucket>/tools/
+    aws emr add-steps --cluster-id j-XXXXXXXX --steps \
+'Type=CUSTOM_JAR,Name=yarn-resource-config,ActionOnFailure=CONTINUE,Jar=command-runner.jar,\
+Args=[bash,-c,"aws s3 cp s3://<bucket>/tools/yarn_resource_config.py - | python3 - --queue etl"]'
+
+More: https://github.com/ryandam9/yarn-resource-config"""
+
+
 def main() -> None:
     if sys.version_info < (3, 6):
         sys.exit("This script needs Python 3.6 or later (found %s)." % sys.version.split()[0])
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument(
-        "--hadoop-conf",
-        default=first_dir(os.environ.get("HADOOP_CONF_DIR"), os.environ.get("YARN_CONF_DIR"), "/etc/hadoop/conf"),
-        help="directory with yarn-site.xml and capacity-scheduler.xml",
+    ap = argparse.ArgumentParser(
+        usage="python3 %(prog)s [options]",
+        description=HELP_DESCRIPTION,
+        epilog=HELP_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument(
-        "--spark-conf",
-        default=first_dir(os.environ.get("SPARK_CONF_DIR"), "/etc/spark/conf"),
-        help="directory with spark-defaults.conf",
+    check = ap.add_argument_group("what to check")
+    check.add_argument(
+        "--queue",
+        action="append",
+        metavar="NAME",
+        help="the queue to check: its card says whether a new job can start now, and if not, why. "
+        "More than once for more queues. Without it: Spark's queue, the Oozie launcher queue and queues "
+        "with jobs waiting. Needs live data",
     )
-    ap.add_argument(
-        "--oozie-conf",
-        default=first_dir(os.environ.get("OOZIE_CONF_DIR"), "/etc/oozie/conf"),
-        help="directory with oozie-site.xml",
+    check.add_argument(
+        "--account",
+        action="append",
+        metavar="NAME",
+        help="with --queue: the service account to check (the cards, rows and balance sheets show only "
+        "this one). More than once for more accounts",
     )
-    ap.add_argument(
+    check.add_argument(
+        "--group",
+        action="append",
+        metavar="NAME",
+        help="with --queue: a group of service accounts (as in a g:<group>:<queue> mapping). The script does "
+        "not look up who is in it; YARN's limits are per account, so the card shows one account of the "
+        "group with no jobs now",
+    )
+    check.add_argument(
+        "--details",
+        action="store_true",
+        help="also print the balance sheets: every number behind the cards, worked out step by step "
+        "(with --queue, only for those queues)",
+    )
+    check.add_argument(
+        "--watch",
+        type=int,
+        metavar="SECONDS",
+        help="show only the queues and the apps, redrawn every SECONDS (like yarn top). Ctrl-C stops it. "
+        "Needs live data",
+    )
+    source = ap.add_argument_group("where the data comes from")
+    source.add_argument(
         "--live",
         dest="live",
         action="store_true",
         default=None,
-        help="read live usage from the ResourceManager REST API (default on EMR)",
+        help="read live usage from the ResourceManager REST API (the default on EMR)",
     )
-    ap.add_argument("--no-live", dest="live", action="store_false", help="do not contact the ResourceManager")
-    ap.add_argument("--rm", help="ResourceManager web address, for example http://ip-10-0-0-1:8088")
-    ap.add_argument("--all", action="store_true", help="also list every other property in the files")
-    ap.add_argument(
+    source.add_argument("--no-live", dest="live", action="store_false", help="do not contact the ResourceManager")
+    source.add_argument("--rm", metavar="URL", help="ResourceManager web address, for example http://ip-10-0-0-1:8088")
+    source.add_argument(
+        "--hadoop-conf",
+        metavar="DIR",
+        default=first_dir(os.environ.get("HADOOP_CONF_DIR"), os.environ.get("YARN_CONF_DIR"), "/etc/hadoop/conf"),
+        help="directory with yarn-site.xml and capacity-scheduler.xml "
+        "(default: $HADOOP_CONF_DIR, $YARN_CONF_DIR, then /etc/hadoop/conf)",
+    )
+    source.add_argument(
+        "--spark-conf",
+        metavar="DIR",
+        default=first_dir(os.environ.get("SPARK_CONF_DIR"), "/etc/spark/conf"),
+        help="directory with spark-defaults.conf (default: $SPARK_CONF_DIR, then /etc/spark/conf)",
+    )
+    source.add_argument(
+        "--oozie-conf",
+        metavar="DIR",
+        default=first_dir(os.environ.get("OOZIE_CONF_DIR"), "/etc/oozie/conf"),
+        help="directory with oozie-site.xml (default: $OOZIE_CONF_DIR, then /etc/oozie/conf)",
+    )
+    output = ap.add_argument_group("output")
+    output.add_argument("--all", action="store_true", help="also list every other property in the files")
+    output.add_argument(
         "--color",
         choices=("auto", "always", "never"),
         default="auto",
-        help="colour the report: auto (only on a terminal, the default), always or never. NO_COLOR turns it off",
-    )
-    ap.add_argument(
-        "--queue",
-        action="append",
-        metavar="NAME",
-        help="show the card for this queue (can a new job start now, and if not, why) instead of the "
-        "default cards (Spark's queue, the Oozie launcher queue and queues with jobs waiting). More than "
-        "once for more queues. Needs live data",
-    )
-    ap.add_argument(
-        "--account",
-        action="append",
-        metavar="NAME",
-        help="with --queue: show the cards and rows of this service account only (more than once for more)",
-    )
-    ap.add_argument(
-        "--group",
-        action="append",
-        metavar="NAME",
-        help="with --queue: a group of service accounts (as in a g:<group>:<queue> mapping); its card shows "
-        "the numbers of one of its accounts with no jobs now, since YARN's limits are per account",
-    )
-    ap.add_argument(
-        "--details",
-        action="store_true",
-        help="also print the balance sheets: every number behind the queue cards, worked out step by step "
-        "(with --queue, only for those queues)",
-    )
-    ap.add_argument(
-        "--watch",
-        type=int,
-        metavar="SECONDS",
-        help="show only the queues (one line each: AM free, memory free, can a new job start) and the "
-        "apps, redrawn every SECONDS (like yarn top). Needs live data",
+        help="colour: auto (only on a terminal, the default), always or never. NO_COLOR=1 turns it off",
     )
     args = ap.parse_args()
     use_color(args.color)
