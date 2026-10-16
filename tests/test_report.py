@@ -171,6 +171,21 @@ class Report(unittest.TestCase):
             out, r"Service accounts mapped here +yarn\.scheduler\.capacity\.queue-mappings +group analysts"
         )
 
+    def test_help_has_examples(self) -> None:
+        p = subprocess.run([sys.executable, SCRIPT, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        for text in (
+            "examples",
+            "--queue etl --account svc_etl",
+            "--queue etl --group analysts",
+            "--watch 30",
+            "--no-live",
+            "--details",
+            "releases/latest/download/yarn_resource_config.py",
+        ):
+            self.assertIn(text, out)
+
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])
         self.check(rc, out)

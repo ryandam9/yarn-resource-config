@@ -157,6 +157,8 @@ To run it on a schedule, use an EMR step, or cron on the primary or edge node.
 
 ## Options
 
+`python3 yarn_resource_config.py --help` prints the options and an example command for each scenario on the console.
+
 For a quick live view without the rest of the report, Hadoop's own `yarn top` also lists the running apps; `--watch` adds the queue limits, Spark stages and why apps wait.
 
 | Option | Meaning |
