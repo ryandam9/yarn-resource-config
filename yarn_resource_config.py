@@ -719,28 +719,57 @@ class Queue:
         return (self.live.get(key) or {}).get("memory")
 
 
+def child_shares(cs: ConfigFile, path: str) -> List[Tuple[str, Optional[float], Optional[float]]]:
+    """The children of a queue in capacity-scheduler.xml: [(path, capacity %, maximum-capacity %)], both as
+    shares of the parent. Weights (2w, 1w) give each child its weight / the sum of weights."""
+    children = cs.get("yarn.scheduler.capacity.%s.queues" % path)
+    if not children:
+        return []
+    names = [c.strip() for c in children.split(",") if c.strip()]
+    raws = [(cs.get("yarn.scheduler.capacity.%s.%s.capacity" % (path, n)) or "").strip() for n in names]
+    weights = [to_float(r[:-1]) if r.lower().endswith("w") else None for r in raws]
+    caps: List[Optional[float]]
+    known = [w for w in weights if w is not None]
+    if weights and len(known) == len(weights):
+        caps = [w * 100.0 / (sum(known) or 1.0) for w in known]
+    else:
+        caps = [to_float(r) for r in raws]
+    out: List[Tuple[str, Optional[float], Optional[float]]] = []
+    for child, cap in zip(names, caps):
+        p = "%s.%s" % (path, child)
+        maxcap = to_float(cs.get("yarn.scheduler.capacity.%s.maximum-capacity" % p, "100"))
+        if maxcap is not None and maxcap < 0:  # -1 means 100
+            maxcap = 100.0
+        out.append((p, cap, maxcap))
+    return out
+
+
+def queue_shares(cs: ConfigFile) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    """Each queue's guaranteed and maximum share of the whole cluster (0..1), parents too, from the file."""
+    shares: Dict[str, Tuple[Optional[float], Optional[float]]] = {"root": (1.0, 1.0)}
+
+    def walk(path: str) -> None:
+        abs_cap, abs_max = shares[path]
+        for p, cap, maxcap in child_shares(cs, path):
+            shares[p] = (
+                abs_cap * cap / 100.0 if (abs_cap is not None and cap is not None) else None,
+                abs_max * maxcap / 100.0 if (abs_max is not None and maxcap is not None) else None,
+            )
+            walk(p)
+
+    walk("root")
+    return shares
+
+
 def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
     """Leaf queues from capacity-scheduler.xml, completed (or replaced) by the live data."""
     queues: Dict[str, Queue] = {}
     global_am = to_float(cs.get("yarn.scheduler.capacity.maximum-am-resource-percent", "0.1"))
 
     def walk(path: str, abs_cap: Optional[float], abs_max: Optional[float]) -> None:
-        children = cs.get("yarn.scheduler.capacity.%s.queues" % path)
+        children = child_shares(cs, path)
         if children:
-            names = [c.strip() for c in children.split(",") if c.strip()]
-            raws = [(cs.get("yarn.scheduler.capacity.%s.%s.capacity" % (path, n)) or "").strip() for n in names]
-            weights = [to_float(r[:-1]) if r.lower().endswith("w") else None for r in raws]
-            caps: List[Optional[float]]
-            known = [w for w in weights if w is not None]
-            if weights and len(known) == len(weights):  # weights (2w, 1w): each child gets weight / sum
-                caps = [w * 100.0 / (sum(known) or 1.0) for w in known]
-            else:
-                caps = [to_float(r) for r in raws]
-            for child, cap in zip(names, caps):
-                p = "%s.%s" % (path, child)
-                maxcap = to_float(cs.get("yarn.scheduler.capacity.%s.maximum-capacity" % p, "100"))
-                if maxcap is not None and maxcap < 0:  # -1 means 100
-                    maxcap = 100.0
+            for p, cap, maxcap in children:
                 walk(
                     p,
                     abs_cap * cap / 100.0 if (abs_cap is not None and cap is not None) else None,
@@ -3979,10 +4008,55 @@ def queue_paths(cs: ConfigFile) -> List[Tuple[str, bool]]:
     return out[1:]  # root itself always has 100%
 
 
-def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, str, str]]]]:
-    """Rows (label, property, value) for the settings of each queue, with the default when not set."""
+def queue_setting_gb(cs: ConfigFile, path: str, suffix: str, shares: Dict[str, Any], total: float) -> str:
+    """What one queue setting means in GB at the current cluster size, as " (...)", or "" when it has no size.
+    Worked out from the values in the file, so each row agrees with the value it shows."""
+    cap, mx = shares.get(path, (None, None))
+    if cap is None or mx is None:
+        return ""
+    prefix = "yarn.scheduler.capacity.%s." % path
+    if suffix in ("capacity", "maximum-capacity"):
+        share = cap if suffix == "capacity" else mx
+        nested = path.count(".") > 1  # a share of a parent below root: say what it is of the cluster
+        return " (%s%s)" % (gb(share * total), "; %s of the cluster" % pct(share) if nested else "")
+    if suffix == "user-limit-factor":
+        ulf = to_float(cs.get(prefix + suffix, "1"))
+        if ulf is None:
+            return ""
+        if ulf <= 0:
+            return " (no limit: the queue max %s)" % gb(mx * total)
+        capped = ulf * cap > mx + 1e-9
+        return " (%s = %g %s guaranteed %s%s)" % (
+            gb(min(ulf * cap, mx) * total),
+            ulf,
+            BOX["times"],
+            gb(cap * total),
+            ", cut to the queue max" if capped else "",
+        )
+    if suffix == "minimum-user-limit-percent":
+        mulp = to_float(cs.get(prefix + suffix, "100"))
+        return "" if mulp is None else " (%s of the guaranteed %s)" % (gb(mulp / 100.0 * cap * total), gb(cap * total))
+    if suffix == "maximum-am-resource-percent":
+        am = to_float(cs.get(prefix + suffix, cs.get("yarn.scheduler.capacity.maximum-am-resource-percent", "0.1")))
+        if am is None:
+            return ""
+        frac = am / 100.0 if am > 1 else am
+        low, high = gb(frac * cap * total), gb(frac * mx * total)
+        return " (%s of the queue: %s)" % (pct(frac), low if low == high else "%s to %s" % (low, high))
+    if suffix == "maximum-allocation-mb":
+        mb_value = to_float(cs.get(prefix + suffix))
+        return "" if mb_value is None else " (%s)" % gb(mb_value)
+    return ""
+
+
+def queue_setting_rows(
+    cs: ConfigFile, total: Optional[float] = None
+) -> List[Tuple[str, bool, List[Tuple[str, str, str]]]]:
+    """Rows (label, property, value) for the settings of each queue, with the default when not set. With the
+    cluster's memory (total, MB), the sizes in GB follow each value."""
     global_am = cs.get("yarn.scheduler.capacity.maximum-am-resource-percent")
     global_apps = cs.get("yarn.scheduler.capacity.max-parallel-apps")
+    shares = queue_shares(cs) if total else {}
     blocks: List[Tuple[str, bool, List[Tuple[str, str, str]]]] = []
     for path, leaf in queue_paths(cs):
         rows: List[Tuple[str, str, str]] = []
@@ -4003,6 +4077,11 @@ def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, 
                 value = "not set"
             else:
                 value = "%s%s (default)" % (default, unit)
+            note = queue_setting_gb(cs, path, suffix, shares, total) if total else ""
+            if note and value.endswith(")"):  # one pair of brackets: "100% (default; 9.60 GB ...)"
+                value = value[:-1] + "; " + note[2:]
+            else:
+                value += note
             rows.append((label, name, value))
         if leaf:
             mapped = [a for a, qn in queue_mappings(cs) if qn == path or path.endswith("." + qn)]
@@ -4018,28 +4097,52 @@ def queue_setting_rows(cs: ConfigFile) -> List[Tuple[str, bool, List[Tuple[str, 
     return blocks
 
 
-def print_settings(files: Dict[str, ConfigFile]) -> None:
+def print_settings(files: Dict[str, ConfigFile], live: Optional[Live] = None) -> None:
+    total = to_float(((live or {}).get("metrics") or {}).get("totalMB")) or None
     section(
         "Settings",
         'The settings behind the findings. "(default)" means that the file does not '
         'have the setting, so YARN, Spark or Oozie uses its default. "(cluster-wide value)" '
-        "means that the queue has no own value and uses the one for all queues.",
+        "means that the queue has no own value and uses the one for all queues."
+        + (
+            " In brackets: what a value means in GB at the current cluster size (%s for YARN), worked out "
+            "from the value shown. It changes when nodes are added or removed." % gb(total)
+            if total
+            else ""
+        ),
     )
+
+    def with_gb(value: str, unit: str, name: str) -> str:
+        """A size in MB or a Spark size (4743M, 4g) also in GB, right after the number: 2048 MB = 2.00 GB."""
+        words = value.split(" ")
+        if name == "yarn.scheduler.capacity.maximum-am-resource-percent" and to_float(words[0]) is not None:
+            return value.replace(")", " of each queue)", 1)
+        if not words or "%" in value:
+            return value
+        size = None
+        if unit == " MB" and len(words) > 1 and words[1] == "MB":
+            size, n = to_float(words[0]), 2
+        elif name.startswith("spark.") and "memory" in name.lower():
+            size, n = to_mb(words[0]), 1
+        if size is None:
+            return value
+        return " ".join(words[:n] + ["=", gb(size)] + words[n:])
+
     rows = {
         key: [
-            (label, name, setting_value(files[key], name, default, unit))
+            (label, name, with_gb(setting_value(files[key], name, default, unit), unit, name))
             for f, label, name, default, unit in SETTINGS
             if f == key
         ]
         for key in files
     }
-    queue_blocks = queue_setting_rows(files["cs"]) if files["cs"].props is not None else []
+    queue_blocks = queue_setting_rows(files["cs"], total) if files["cs"].props is not None else []
     all_rows = [r for rs in rows.values() for r in rs] + [r for _, _, rs in queue_blocks for r in rs]
     w_label = max(len(r[0]) for r in all_rows)
     w_name = max(len(r[1]) for r in all_rows)
 
     def show(label: str, name: str, value: str) -> None:
-        role = "default" if (value.endswith("(default)") or value == "not set") else "value"
+        role = "default" if ("(default" in value or value == "not set") else "value"
         print(
             "  %s  %s  %s"
             % ("%-*s" % (w_label, label), paint(name, "prop") + " " * (w_name - len(name)), paint(value, role))
@@ -4369,7 +4472,7 @@ def main() -> None:
         )
     if live:
         print_nodes(live)
-    print_settings(files)
+    print_settings(files, live)
 
     section("Terms")
     print_terms(TERMS)
