@@ -157,6 +157,8 @@ To run it on a schedule, use an EMR step, or cron on the primary or edge node.
 
 ## Options
 
+`python3 yarn_resource_config.py --help` prints the options and an example command for each scenario on the console.
+
 For a quick live view without the rest of the report, Hadoop's own `yarn top` also lists the running apps; `--watch` adds the queue limits, Spark stages and why apps wait.
 
 | Option | Meaning |
@@ -232,6 +234,10 @@ Notes:
   report uses `spark-defaults.conf`.
 - On EMR, Spark uses `spark.emr.default.executor.memory` and `spark.emr.default.executor.cores`
   when `spark.executor.memory` and `spark.executor.cores` are not set. The report does the same.
+- With live data, the queue settings that the ResourceManager runs with count (state, capacities,
+  `user-limit-factor`, `minimum-user-limit-percent`, `maximum-am-resource-percent`). When
+  `capacity-scheduler.xml` says something else (for example a change not yet applied with
+  `yarn rmadmin -refreshQueues`), a finding lists each difference.
 - Without live data, the report uses the node size from this host's `yarn-site.xml` and shows the
   AM pool as a share of the cluster instead of in GB.
 
@@ -654,7 +660,7 @@ longer fit its AM limit. EMR's own config otherwise.
 ```text
 YARN and Spark resource report
 ==============================
-Created:   2026-10-16 04:36 UTC
+Created:   2026-10-20 22:16 UTC
 Cluster:   j-TEST, emr-7.14.0 (master: 1 x m5.xlarge)
 This host: primary node
 Live data: from the ResourceManager at http://ip-10-0-0-1:8088

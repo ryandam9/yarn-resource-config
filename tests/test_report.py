@@ -171,6 +171,52 @@ class Report(unittest.TestCase):
             out, r"Service accounts mapped here +yarn\.scheduler\.capacity\.queue-mappings +group analysts"
         )
 
+    def test_help_has_examples(self) -> None:
+        p = subprocess.run([sys.executable, SCRIPT, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        for text in (
+            "examples",
+            "--queue etl --account svc_etl",
+            "--queue etl --group analysts",
+            "--watch 30",
+            "--no-live",
+            "--details",
+            "releases/latest/download/yarn_resource_config.py",
+        ):
+            self.assertIn(text, out)
+
+    def test_resourcemanager_wins_over_the_file(self) -> None:
+        # The file says root.etl is RUNNING, the ResourceManager runs it STOPPED: YARN's own state counts.
+        rc, out = run("launcher-in-etl", self.servers["etlstopped"], ["--details", "--color", "never"])
+        self.check(rc, out)
+        self.assertIn("[PROBLEM] Queue root.etl is STOPPED", out)  # the Oozie launcher queue here
+        self.assertNotIn("queue root.etl is RUNNING", out)
+        self.assertIn("queue root.etl is STOPPED: it takes no new apps", out)
+        # a config that has root.etl: the difference to the file is a finding of its own
+        rc, out = run("queues", self.servers["etlstopped"], ["--color", "never"])
+        self.check(rc, out)
+        self.assertIn("[WARNING] Queue root.etl runs with other settings than capacity-scheduler.xml says", out)
+        self.assertIn("state: the file says RUNNING, the ResourceManager runs with STOPPED", out)
+
+    def test_fixes_make_room_for_one_more_job(self) -> None:
+        # 6.00 GB AM limit per account, 2.88 GB per Oozie job: 2 fit; the fix must make room for a third.
+        rc, out = run("default", self.servers["clear"], ["--color", "never"])
+        self.check(rc, out)
+        joined = re.sub(r"\s+", " ", out)
+        self.assertIn("allow about 2 Oozie jobs at once per service account", joined)
+        m = re.search(r"each service account's AM limit becomes about ([\d.]+) GB", joined)
+        assert m is not None, joined
+        self.assertGreaterEqual(float(m.group(1)), 3 * 2.88)
+
+    def test_details_hint_only_without_details(self) -> None:
+        hint = "run again with --details"
+        rc, out = run("default", self.servers["ok"], ["--queue", "default", "--color", "never"])
+        self.assertIn(hint, out)
+        rc, out = run("default", self.servers["ok"], ["--queue", "default", "--details", "--color", "never"])
+        self.check(rc, out)
+        self.assertNotIn(hint, out)
+
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])
         self.check(rc, out)
