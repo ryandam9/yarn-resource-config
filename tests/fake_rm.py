@@ -11,6 +11,7 @@ Modes change the cluster state:
   dead    two queues; an Oozie job (launcher + Spark AM) needs more than the user's AM limit
   clear   two queues with room everywhere
   two     like clear (the launchers run in another queue when the config says so)
+  etlstopped  like two, but the ResourceManager runs queue root.etl STOPPED (the file says RUNNING)
   over    one user above the queue's guaranteed share
   fair    the Fair Scheduler, which the report does not cover
   401 403 the ResourceManager refuses every request
@@ -35,6 +36,7 @@ MODES = (
     "dead",
     "clear",
     "two",
+    "etlstopped",
     "over",
     "fair",
     "401",
@@ -207,7 +209,7 @@ def build(mode: str) -> Dict[str, Any]:
         }
         cluster_free(9216)
         one_app(6144)
-    elif mode in ("dead", "clear", "two"):
+    elif mode in ("dead", "clear", "two", "etlstopped"):
         dead = mode == "dead"
         default.update(
             {
@@ -242,7 +244,7 @@ def build(mode: str) -> Dict[str, Any]:
                 "userLimitFactor": 1.0,
                 "numActiveApplications": 0,
                 "numPendingApplications": 0,
-                "state": "RUNNING",
+                "state": "STOPPED" if mode == "etlstopped" else "RUNNING",
             }
         )
         cluster_free(9216)

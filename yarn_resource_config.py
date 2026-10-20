@@ -650,7 +650,8 @@ def spark_limits(base: str, app_id: str) -> Optional[Dict[str, str]]:
 def pending_request(app: Json) -> Tuple[int, Optional[int]]:
     """What a running app asks YARN for and does not have yet: (containers, MB each).
     (0, None) when it asks for nothing."""
-    count, size = 0, None  # type: int, Optional[int]
+    count: int = 0
+    size: Optional[int] = None
     for r in app.get("resourceRequests") or []:
         if r.get("resourceName", "*") != "*":  # host and rack requests repeat the "*" one
             continue
@@ -680,7 +681,7 @@ def spark_stages(base: str, app_id: str) -> Optional[List[Json]]:
     url = "%s/proxy/%s/api/v1/applications/%s/stages?status=active" % (base, app_id, app_id)
     try:
         stages = get_json(url, timeout=5)
-    except (RMError, Exception):  # noqa: BLE001 - this extra detail must never stop the report
+    except Exception:  # noqa: BLE001 - this extra detail must never stop the report
         return None
     return stages if isinstance(stages, list) else None
 
@@ -702,6 +703,7 @@ class Queue:
         self.live: Optional[Json] = None  # the queue from the REST API
         self.accounts: List[str] = []  # service accounts mapped to this queue (queue-mappings)
         self.chosen: Optional[List[str]] = None  # the accounts named with --account / --group, if any
+        self.file_diffs: List[Tuple[str, str, str]] = []  # (setting, file value, ResourceManager value)
 
     @property
     def one_user_max(self) -> Optional[float]:
@@ -760,14 +762,10 @@ def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
         walk("root", 1.0, 1.0)
     for path, lq in ((live or {}).get("queues") or {}).items():
         q = queues.get(path)
-        if q is None:  # no capacity-scheduler.xml here (edge node): take it from the live data
+        from_file = q is not None
+        if q is None:  # no capacity-scheduler.xml here (edge node): the live data only
             q = queues[path] = Queue(path)
-            q.abs_cap = (lq.get("absoluteCapacity") or 0) / 100.0
-            q.abs_max = (lq.get("absoluteMaxCapacity") or 0) / 100.0
-            q.ulf = to_float(lq.get("userLimitFactor")) or 1.0
-            q.min_user_pct = to_float(lq.get("userLimit")) or 100.0
-            q.am_pct = to_float(lq.get("maxAMResourcePercentage")) if "maxAMResourcePercentage" in lq else None
-            q.state = (lq.get("state") or "RUNNING").upper()
+        apply_live(q, lq, from_file)
         q.live = lq
         if not q.ordering and lq.get("orderingPolicyInfo"):
             q.ordering = str(lq.get("orderingPolicyInfo"))
@@ -776,6 +774,33 @@ def build_queues(cs: ConfigFile, live: Optional[Live]) -> Dict[str, Queue]:
         if q is not None and account not in q.accounts:
             q.accounts.append(account)
     return queues
+
+
+def apply_live(q: Queue, lq: Json, from_file: bool) -> None:
+    """Take what the ResourceManager runs with: it wins over capacity-scheduler.xml, which can be newer or
+    older (changes count only after yarn rmadmin -refreshQueues). Differences go to q.file_diffs."""
+
+    def take(attr: str, value: Any, setting: str, show: Callable[[Any], str]) -> None:
+        if value is None:
+            return
+        old = getattr(q, attr)
+        if from_file and old is not None:
+            same = old == value if isinstance(value, str) else abs(float(old) - float(value)) < 1e-4
+            if not same:
+                q.file_diffs.append((setting, show(old), show(value)))
+        setattr(q, attr, value)
+
+    def share(key: str) -> Optional[float]:
+        v = to_float(lq.get(key)) if key in lq else None
+        return None if v is None else v / 100.0
+
+    am = to_float(lq.get("maxAMResourcePercentage")) if "maxAMResourcePercentage" in lq else None
+    take("state", (lq.get("state") or "").upper() or None, "state", str)
+    take("abs_cap", share("absoluteCapacity"), "capacity (share of the cluster)", pct)
+    take("abs_max", share("absoluteMaxCapacity"), "maximum-capacity (share of the cluster)", pct)
+    take("ulf", to_float(lq.get("userLimitFactor")), "user-limit-factor", lambda v: "%g" % v)
+    take("min_user_pct", to_float(lq.get("userLimit")), "minimum-user-limit-percent", lambda v: "%g%%" % v)
+    take("am_pct", None if am is None else (am / 100.0 if am > 1 else am), "maximum-am-resource-percent", pct)
 
 
 def queue_mappings(cs: ConfigFile, kind: str = "u") -> List[Tuple[str, str]]:
@@ -852,7 +877,8 @@ def spark_containers(spark: ConfigFile, min_alloc: float) -> Tuple[Container, Co
     else:
         heap, note = 1024, "Spark default"
     ovh, ovh_note = overhead("spark.executor.memoryOverhead", "spark.executor.memoryOverheadFactor", heap)
-    other, other_notes = 0, []  # type: int, List[str]
+    other: int = 0
+    other_notes: List[str] = []
     if spark.get("spark.executor.pyspark.memory"):
         other += to_mb(spark.get("spark.executor.pyspark.memory")) or 0
         other_notes.append("Python workers")
@@ -960,16 +986,35 @@ def find_problems(
             "queue. Apps are rejected at submit unless spark-submit gives another queue with --queue." % queue_name,
             "Set spark.yarn.queue to one of: %s." % ", ".join(sorted(queues)),
         )
-    if q is not None and q.state != "RUNNING":
-        add(
-            "PROBLEM",
-            "Queue %s is %s" % (q.path, q.state),
-            "A stopped queue accepts no new apps. Spark apps sent to it are rejected.",
-            "Set yarn.scheduler.capacity.%s.state to RUNNING and refresh the queues." % q.path,
-        )
+    launcher_queue = (
+        find_queue(queues, oozie.get("oozie.launcher.default.queue", "default")) if oozie.props is not None else None
+    )
+    for sq in (q, launcher_queue) if launcher_queue is not q else (q,):
+        if sq is not None and sq.state != "RUNNING":
+            add(
+                "PROBLEM",
+                "Queue %s is %s" % (sq.path, sq.state),
+                "A stopped queue accepts no new apps. %s sent to it are rejected."
+                % ("Spark apps" if sq is q else "Oozie launchers (oozie.launcher.default.queue)"),
+                "Set yarn.scheduler.capacity.%s.state to RUNNING and refresh the queues." % sq.path,
+            )
+    # ---- capacity-scheduler.xml and the ResourceManager disagree: the report uses the ResourceManager's values
+    for path in sorted(queues):
+        diffs = queues[path].file_diffs
+        if diffs:
+            add(
+                "WARNING" if any(d[0] == "state" for d in diffs) else "NOTE",
+                "Queue %s runs with other settings than capacity-scheduler.xml says" % path,
+                [
+                    "%s: the file says %s, the ResourceManager runs with %s" % (setting, in_file, running)
+                    for setting, in_file, running in diffs
+                ]
+                + ["The report uses the ResourceManager's values: they are the ones YARN applies now."],
+                "If the file is the newer one, apply it with yarn rmadmin -refreshQueues (on the primary node).",
+            )
 
     # ---- one container must fit under YARN's per-container limit
-    limit = q.max_alloc_mb if (q is not None and q.max_alloc_mb) else max_alloc
+    max_container = q.max_alloc_mb if (q is not None and q.max_alloc_mb) else max_alloc
     limit_name = (
         "yarn.scheduler.capacity.%s.maximum-allocation-mb" % q.path
         if (q is not None and q.max_alloc_mb)
@@ -978,7 +1023,7 @@ def find_problems(
     # Without spark-defaults.conf the sizes are only Spark's defaults; without yarn-site.xml the
     # limits are only YARN's defaults. Then the checks would say nothing about this cluster.
     sizes_known = spark.props is not None
-    too_big = [c for c in (executor, am) if c.total > limit] if (sizes_known and yarn.props is not None) else []
+    too_big = [c for c in (executor, am) if c.total > max_container] if (sizes_known and yarn.props is not None) else []
     for c in too_big:
         add(
             "PROBLEM",
@@ -990,7 +1035,7 @@ def find_problems(
                 gb(c.heap),
                 gb(c.overhead),
                 " + %s" % gb(c.other) if c.other else "",
-                gb(limit),
+                gb(max_container),
                 limit_name,
             ),
             "Make the container smaller (%s or its overhead), or raise %s." % (c.heap_note, limit_name),
@@ -1000,7 +1045,7 @@ def find_problems(
             "OK",
             "Each Spark container fits under YARN's per-container limit",
             "Executor %s and ApplicationMaster %s; the limit is %s (%s)."
-            % (gb(executor.total), gb(am.total), gb(limit), limit_name),
+            % (gb(executor.total), gb(am.total), gb(max_container), limit_name),
         )
     if uses_vcores and sizes_known and yarn.props is not None:
         for c in (executor, am):
@@ -1131,10 +1176,11 @@ def find_problems(
                         "" if per_user == 1 else "s",
                     )
                 )
-            fixes = am_limit_fixes(
-                q.path, q.ulf, q.am_pct, limit, 0.0, need, launcher_mb if l_here else 0.0, am.size, bool(user_lim)
-            )
+            l_mb = launcher_mb if l_here else 0.0
+            user_binds = bool(user_lim) and user_lim <= pool  # which AM limit is the smaller one
             if need > limit:
+                # nothing else runs and one job still does not fit: room for that one job
+                fixes = am_limit_fixes(q.path, q.ulf, q.am_pct, limit, 0.0, need, l_mb, am.size, user_binds)
                 add(
                     "PROBLEM",
                     "%s %s can never start in queue %s" % ("An" if l_here else "A", kind, q.path),
@@ -1145,7 +1191,7 @@ def find_problems(
                             "%s is more than %s AM limit (%s), so the job never starts%s."
                             % (
                                 gb(need),
-                                "each service account's" if user_lim and user_lim <= pool else "the queue's",
+                                "each service account's" if user_binds else "the queue's",
                                 gb(limit),
                                 ": the launcher starts, and the Spark AM then waits in ACCEPTED for good"
                                 if l_here
@@ -1156,6 +1202,8 @@ def find_problems(
                     fixes,
                 )
             elif pending and pool_used is not None and pool_used + am.size > pool:
+                # the queue's AM limit is full now: room for one more job on top of what runs
+                fixes = am_limit_fixes(q.path, q.ulf, q.am_pct, pool, pool_used, need, l_mb, am.size, False)
                 add(
                     "PROBLEM",
                     "Jobs wait in queue %s because its AM limit is full" % q.path,
@@ -1168,6 +1216,8 @@ def find_problems(
                 )
             else:
                 most = min(in_queue, per_user) if per_user is not None else in_queue
+                # room for one more job at once than the limits allow now
+                fixes = am_limit_fixes(q.path, q.ulf, q.am_pct, limit, most * need, need, l_mb, am.size, user_binds)
                 add(
                     "OK" if most >= 3 else "WARNING",
                     "The AM limits of queue %s allow about %d %s%s at once%s"
@@ -2140,7 +2190,7 @@ def why_user_am(b: Balance, user: User, need: float, what: str, same_u: float) -
     }
 
 
-def why_node(b: Balance, need: float, what: str, biggest: float, free_total: float) -> Why:
+def why_node(need: float, what: str, biggest: float, free_total: float) -> Why:
     return {
         "title": "No single node has room for the %s" % what,
         "what": [
@@ -2225,7 +2275,7 @@ def am_step(
         (
             biggest >= size,
             pre + "the most free on one node: %s (a container must fit on one node)" % gb(biggest),
-            why_node(b, size, what, biggest, sum(nodes or [0])),
+            why_node(size, what, biggest, sum(nodes or [0])),
         )
     )
     room_by: Tuple[str, Any] = ("room", scope)
@@ -2248,53 +2298,26 @@ def am_step(
     return ok, checks, room - size, room_by
 
 
-def executors_fit(
-    b: Balance, room_left: float, nodes: List[float], room_by: Tuple[str, Any], same_u: float = 0
-) -> Tuple[int, Optional[Why]]:
-    """How many executors fit now, and if none: the explanation of what stops them."""
-    size = b["executor_size"]
-    if not size:
-        return 0, None
-    on_nodes = sum(int(max(0, f) // size) for f in nodes)
-    n = min(on_nodes, int(max(0, room_left) // size))
-    if n:
-        return n, None
-    what = "executor (%s)" % gb(size)
-    if room_left < size:
-        if room_by[0] == "user":
-            return 0, why_user_limit(b, room_by[1], size, "first executor", same_u)
-        return 0, why_room(b, room_by[1], size, "first executor")
-    return 0, why_node(b, size, what, max(nodes or [0]), sum(nodes or [0]))
-
-
-def new_app_check(b: Balance, user: Optional[User] = None) -> Tuple[bool, List[Check], int, Optional[Why]]:
-    """Can a new Spark app (spark-submit) start in the queue now?
-    Returns (yes, [(ok, text, explanation)], executors, explanation when no executor fits)."""
-    nodes = list(b["nodes_free"])
-    yes, checks, left, room_by = am_step(b, user, b["am_size"], "Spark AM", [], nodes)
-    if not yes:
-        return False, checks, 0, None
-    n, why = executors_fit(b, left, nodes, room_by, b["am_size"])
-    return True, checks, n, why
+def new_app_check(b: Balance, user: Optional[User] = None) -> Tuple[bool, List[Check]]:
+    """Can a new Spark app (spark-submit) start in the queue now? Returns (yes, [(ok, text, explanation)]).
+    Each job sets its own executors, so only its start is checked."""
+    yes, checks, _, _ = am_step(b, user, b["am_size"], "Spark AM", [], list(b["nodes_free"]))
+    return yes, checks
 
 
 def oozie_check(
     b_launch: Balance, b_spark: Balance, name: Optional[str], launcher_size: float
-) -> Tuple[bool, Optional[str], List[Check], int, Optional[Why]]:
+) -> Tuple[bool, Optional[str], List[Check]]:
     """Can a Spark action of an Oozie workflow start now? The launcher AM starts first in the launcher queue
     and stays until the Spark job ends; then the Spark AM must fit as well.
-    Returns (yes, failed step or None, [(ok, text, explanation)], executors, explanation when none fit)."""
+    Returns (yes, failed step or None, [(ok, text, explanation)])."""
     nodes = list(b_spark["nodes_free"])
     ok1, checks1, _, _ = am_step(b_launch, user_in(b_launch, name), launcher_size, "launcher", [], nodes)
     if not ok1:
-        return False, "launcher", checks1, 0, None
+        return False, "launcher", checks1
     taken = [(b_launch["q"].path, launcher_size)]
-    ok2, checks2, left, room_by = am_step(b_spark, user_in(b_spark, name), b_spark["am_size"], "Spark AM", taken, nodes)
-    if not ok2:
-        return False, "spark", checks1 + checks2, 0, None
-    same_u = sum(m for path, m in taken if path == b_spark["q"].path) + b_spark["am_size"]
-    n, why = executors_fit(b_spark, left, nodes, room_by, same_u)
-    return True, None, checks1 + checks2, n, why
+    ok2, checks2, _, _ = am_step(b_spark, user_in(b_spark, name), b_spark["am_size"], "Spark AM", taken, nodes)
+    return ok2, None if ok2 else "spark", checks1 + checks2
 
 
 LEDGER_W = 54
@@ -2487,18 +2510,12 @@ def print_balance(
     for user in users:
         name = user["name"] if user else None
         mine = user_in(b, name)
-        yes, checks, executors, why_exec = new_app_check(b, mine)
+        yes, checks = new_app_check(b, mine)
         print()
         print("      " + paint("As %s, with spark-submit:" % who(mine), "label"))
         print_checks(checks)
         print_verdict(
-            yes,
-            executors,
-            b["executor_size"],
-            ["it waits in ACCEPTED.", "ACCEPTED means: YARN has the app, but does not start it yet."],
-            checks,
-            why_exec,
-            seen,
+            yes, ["it waits in ACCEPTED.", "ACCEPTED means: YARN has the app, but does not start it yet."], checks, seen
         )
         if oozie:
             b_launch, launcher_size = oozie
@@ -2516,7 +2533,7 @@ def print_balance(
                     "label",
                 )
             )
-            yes, failed, checks, executors, why_exec = oozie_check(b_launch, b, name, launcher_size)
+            yes, failed, checks = oozie_check(b_launch, b, name, launcher_size)
             print_checks(checks)
             both = launcher_size + b["am_size"]
             limits = [
@@ -2550,7 +2567,7 @@ def print_balance(
                 ]
             if never:  # waiting or another account does not help: every service account has the same AM limit
                 checks = [(ok, text, never_fixes(why)) for ok, text, why in checks]
-            print_verdict(yes, executors, b["executor_size"], why_not, checks, why_exec, seen)
+            print_verdict(yes, why_not, checks, seen)
     if not b["users"] and not b["q"].accounts:
         print(
             highlight(
@@ -2627,15 +2644,7 @@ def print_why(why: Why, also: Sequence[str] = (), seen: Optional[Set[str]] = Non
         bullets([("no", t) for t in also], sub)
 
 
-def print_verdict(
-    yes: bool,
-    executors: int,
-    executor_size: int,
-    why_not: List[str],
-    checks: List[Check],
-    why_exec: Optional[Why] = None,
-    seen: Optional[Set[str]] = None,
-) -> None:
+def print_verdict(yes: bool, why_not: List[str], checks: List[Check], seen: Optional[Set[str]] = None) -> None:
     """why_not: the headline when the app cannot start, then more lines, shown as bullets."""
     ind = "        "
     if not yes:
@@ -2934,9 +2943,7 @@ def block_title(number: int, title: str, kind: Optional[str], status: str) -> No
     )
 
 
-def am_limit_rows(
-    free: float, am: float, oozie_need: Optional[float], name: str
-) -> List[Tuple[Optional[str], str, str, str]]:
+def am_limit_rows(free: float, am: float, oozie_need: Optional[float]) -> List[Tuple[Optional[str], str, str, str]]:
     """The "how many fit" rows of an AM block: Oozie jobs (launcher + Spark AM) first when Oozie is used."""
     rows: List[Tuple[Optional[str], str, str, str]] = []
     if oozie_need:
@@ -2957,7 +2964,12 @@ def am_limit_rows(
 
 
 def print_queue_card(
-    b: Balance, user: User, am_c: Container, oozie: Optional[Tuple[Balance, float]], uses_vcores: bool
+    b: Balance,
+    user: User,
+    am_c: Container,
+    oozie: Optional[Tuple[Balance, float]],
+    uses_vcores: bool,
+    details: bool = False,
 ) -> None:
     q = b["q"]
     am = float(b["am_size"])
@@ -3127,7 +3139,7 @@ def print_queue_card(
                     gb(free_u),
                 ),
             ]
-            + am_limit_rows(free_u, am, oozie_need, name)
+            + am_limit_rows(free_u, am, oozie_need)
         )
         formula_rows(rows)
 
@@ -3178,7 +3190,7 @@ def print_queue_card(
                 gb(b["am_used"]),
             ),
             ("ok" if free_q >= need else "no", "Free", "%s - %s" % (gb(b["am_limit"]), gb(b["am_used"])), gb(free_q)),
-        ] + am_limit_rows(free_q, am, oozie_need, name)
+        ] + am_limit_rows(free_q, am, oozie_need)
         formula_rows(rows)
         if n and user_am_left is not None and user_am_left < need:
             bullets(["%s cannot use this room: its own AM limit (block 1) is the one that is short." % name], "      ")
@@ -3332,7 +3344,8 @@ def print_queue_card(
         print("  " + paint("What you can do", "label"))
         bullets(fixes, "    ", numbered=True)
     print()
-    print(highlight(wrap("All numbers in detail (the balance sheet): run again with --details.", "  ")))
+    if not details:
+        print(highlight(wrap("All numbers in detail (the balance sheet): run again with --details.", "  ")))
     if not uses_vcores:
         print(highlight(wrap("Only memory counts here: the resource calculator ignores vcores.", "  ")))
 
@@ -3357,6 +3370,7 @@ def print_queue_cards(
     executor: Container,
     files: Dict[str, ConfigFile],
     l_size: Optional[int],
+    details: bool = False,
 ) -> None:
     """One card per queue named with --queue, and per service account in it: those with apps there now,
     then those mapped to it in queue-mappings."""
@@ -3392,7 +3406,7 @@ def print_queue_cards(
             )
             continue
         for account_name in queue_accounts(q, live) or [None]:
-            print_queue_card(b, user_in(b, account_name), am, oozie, uses_vcores)
+            print_queue_card(b, user_in(b, account_name), am, oozie, uses_vcores, details)
 
 
 # What YARN says when an app waits in ACCEPTED, in plain words
@@ -3620,10 +3634,10 @@ def why_no_resources(app: Json, live: Live, queues: Dict[str, Queue]) -> Optiona
                 % (gb(need), gb(node_free)),
             ),
         ]
-    out = [
+    out: List[Point] = [
         head,
         ("no", "the cluster is full: %s free, the most on one node %s" % (gb(free_total), gb(node_free))),
-    ]  # type: List[Point]
+    ]
     if q is not None and q.abs_cap is not None and total:
         q_used = to_float(((q.live or {}).get("resourcesUsed") or {}).get("memory")) or 0
         if q_used > q.abs_cap * total:
@@ -3841,7 +3855,7 @@ def watch(seconds: int, files: Dict[str, ConfigFile], rm: Optional[str], executo
                     launcher_q,
                     am,
                     executor,
-                    False,
+                    "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower(),
                     full=False,
                     launcher_size=launcher_size(files, min_alloc),
                 )
@@ -4328,7 +4342,7 @@ def main() -> None:
     # the answer: a card for each queue named with --queue, else for the queues that matter
     card_queues = args.queue or default_card_queues(queues, spark_q, launcher_q)
     if card_queues and (live or args.queue):
-        print_queue_cards(card_queues, queues, live, am, executor, files, launcher_size(files, min_alloc))
+        print_queue_cards(card_queues, queues, live, am, executor, files, launcher_size(files, min_alloc), args.details)
     if live:
         print_apps(live, queues)
     print_containers(executor, am, deploy, files["spark"], files["oozie"], launcher_size(files, min_alloc))
@@ -4336,20 +4350,16 @@ def main() -> None:
         print_queues(
             queues,
             queue_groups(files["cs"], live),
-            find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
-            find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
-            if files["oozie"].props is not None
-            else None,
+            spark_q,
+            launcher_q,
             am,
         )
     if live and queues:
         print_balances(
             queues,
             live,
-            find_queue(queues, files["spark"].get("spark.yarn.queue", "default")),
-            find_queue(queues, files["oozie"].get("oozie.launcher.default.queue", "default"))
-            if files["oozie"].props is not None
-            else None,
+            spark_q,
+            launcher_q,
             am,
             executor,
             "dominant" in files["cs"].get("yarn.scheduler.capacity.resource-calculator", "").lower(),
