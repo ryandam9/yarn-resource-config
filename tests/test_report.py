@@ -217,6 +217,28 @@ class Report(unittest.TestCase):
         self.check(rc, out)
         self.assertNotIn(hint, out)
 
+    def test_settings_in_gb(self) -> None:
+        # With live data, each queue setting also says what it means in GB at the current cluster size (24 GB).
+        rc, out = run("queues", self.servers["ok"], ["--color", "never"])
+        self.check(rc, out)
+        settings = out[out.index("\nSETTINGS\n") :]
+        for text in (
+            "40% (9.60 GB)",  # capacity of root.etl
+            "80% (19.20 GB)",  # maximum-capacity
+            "2 (19.20 GB = 2 \u00d7 guaranteed 9.60 GB)",  # user-limit-factor
+            "0.3 (30% of the queue: 2.88 GB to 5.76 GB)",  # maximum-am-resource-percent
+            "50% (2.40 GB; 10% of the cluster)",  # a child of root.analytics
+            "100% (default; 9.60 GB of the guaranteed 9.60 GB)",  # minimum-user-limit-percent
+            "0.5 (50% of each queue)",
+            "12288 MB = 12.00 GB",
+            "4743M = 4.63 GB",
+        ):
+            self.assertIn(text, settings)
+        rc, out = run("queues", None, ["--color", "never"])  # no cluster size without live data
+        self.check(rc, out)
+        self.assertIn("40%\n", out)
+        self.assertNotIn("40% (9.60 GB)", out)
+
     def test_memory_in_gb(self) -> None:
         rc, out = run("default", self.servers["ok"], ["--color", "never"])
         self.check(rc, out)

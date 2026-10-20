@@ -206,7 +206,7 @@ On a terminal the report uses colour so that the parts are easy to tell apart:
 | Queues | The queue tree, one frame per parent queue: each frame holds the children of one parent, with their share of that parent ("Of parent") and, under the frame, the sum of those shares (green with ✓ when it is 100%, red when not). Frames next to each other have different colours. For each leaf queue: guaranteed and maximum share of the cluster, the most one service account can use ("Per account"), the AM pool use, used memory, running and waiting apps. Marks the queue that Spark and the Oozie launchers use. Below the table, "What the columns mean" explains each column in plain words, and an example reads the numbers of Spark's queue: what it always gets, how far it can grow, what one service account can use and how many more apps can start. |
 | Queues now | Live only. One row per service account of each queue (with jobs there now, or mapped to it): the AM limit that is free for it, how many new jobs that is (Oozie jobs where the launchers run, launcher + Spark AM; else spark-submit jobs), the memory that is free for it, and whether a new job can start now (if not, the first reason). Each job sets its own executors, so it does not count them. With `--details`, a balance sheet for each queue that matters follows (see below). |
 | Nodes | Live only: memory and vcores of each node, used and free, containers and state. |
-| Settings | The settings behind the findings, with a plain label, the value (or the default used) and the property name. Under `capacity-scheduler.xml` it also lists the settings of each queue, such as `yarn.scheduler.capacity.root.<queue>.user-limit-factor`, and the service accounts mapped to it (`queue-mappings`); see the example below. |
+| Settings | The settings behind the findings, with a plain label, the value (or the default used) and the property name. Sizes in MB are also shown in GB, and with live data each queue setting says in brackets what it means in GB at the current cluster size: `40% (9.60 GB)`, `user-limit-factor 2 (19.20 GB = 2 × guaranteed 9.60 GB)`, `maximum-am-resource-percent 0.3 (30% of the queue: 2.88 GB to 5.76 GB)`. Under `capacity-scheduler.xml` it also lists the settings of each queue, such as `yarn.scheduler.capacity.root.<queue>.user-limit-factor`, and the service accounts mapped to it (`queue-mappings`); see the example below. |
 | Terms | Container, ApplicationMaster, AM pool, overhead and the other terms used in the report. |
 
 The checks:
@@ -244,25 +244,27 @@ Notes:
 ### Queue settings
 
 Under `capacity-scheduler.xml`, the Settings table lists each queue by name. A queue that does
-not set a value shows the default, or the cluster-wide value that it inherits. A parent queue
+not set a value shows the default, or the cluster-wide value that it inherits. With live data, each value
+also says in brackets what it means in GB at the current cluster size, worked out from the value
+shown (so the numbers move when nodes are added or removed). A parent queue
 shows only its share and state, because only leaf queues run apps. Example from a test config with
 three queues:
 
 ```text
   Queue root.etl
-  Guaranteed share of the parent             yarn.scheduler.capacity.root.etl.capacity                                   40%
-  Most share of the parent                   yarn.scheduler.capacity.root.etl.maximum-capacity                           80%
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.etl.capacity                                   40% (9.60 GB)
+  Most share of the parent                   yarn.scheduler.capacity.root.etl.maximum-capacity                           80% (19.20 GB)
   State                                      yarn.scheduler.capacity.root.etl.state                                      RUNNING (default)
-  One service account: x guaranteed share    yarn.scheduler.capacity.root.etl.user-limit-factor                          2
-  Smallest share per active service account  yarn.scheduler.capacity.root.etl.minimum-user-limit-percent                 100% (default)
-  AM pool share                              yarn.scheduler.capacity.root.etl.maximum-am-resource-percent                0.3
+  One service account: x guaranteed share    yarn.scheduler.capacity.root.etl.user-limit-factor                          2 (19.20 GB = 2 × guaranteed 9.60 GB)
+  Smallest share per active service account  yarn.scheduler.capacity.root.etl.minimum-user-limit-percent                 100% (default; 9.60 GB of the guaranteed 9.60 GB)
+  AM pool share                              yarn.scheduler.capacity.root.etl.maximum-am-resource-percent                0.3 (30% of the queue: 2.88 GB to 5.76 GB)
   Largest container: memory                  yarn.scheduler.capacity.root.etl.maximum-allocation-mb                      cluster limit (default)
   Most running apps                          yarn.scheduler.capacity.root.etl.max-parallel-apps                          no limit (default)
   Service accounts mapped here               yarn.scheduler.capacity.queue-mappings                                      svc_etl, svc_load
 
   Queue root.analytics  (parent queue: its children share it)
-  Guaranteed share of the parent             yarn.scheduler.capacity.root.analytics.capacity                             20%
-  Most share of the parent                   yarn.scheduler.capacity.root.analytics.maximum-capacity                     100% (default)
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.analytics.capacity                             20% (4.80 GB)
+  Most share of the parent                   yarn.scheduler.capacity.root.analytics.maximum-capacity                     100% (default; 24.00 GB)
   State                                      yarn.scheduler.capacity.root.analytics.state                                RUNNING (default)
 ```
 
@@ -660,7 +662,7 @@ longer fit its AM limit. EMR's own config otherwise.
 ```text
 YARN and Spark resource report
 ==============================
-Created:   2026-10-20 22:16 UTC
+Created:   2026-10-20 23:26 UTC
 Cluster:   j-TEST, emr-7.14.0 (master: 1 x m5.xlarge)
 This host: primary node
 Live data: from the ResourceManager at http://ip-10-0-0-1:8088
@@ -1068,34 +1070,35 @@ SETTINGS
 --------
 The settings behind the findings. "(default)" means that the file does not have the setting, so
 YARN, Spark or Oozie uses its default. "(cluster-wide value)" means that the queue has no own value
-and uses the one for all queues.
+and uses the one for all queues. In brackets: what a value means in GB at the current cluster size
+(24.00 GB for YARN), worked out from the value shown. It changes when nodes are added or removed.
 
   Description                                Setting                                                           Value
 
   /etc/hadoop/conf/yarn-site.xml
-  Largest container: memory                  yarn.scheduler.maximum-allocation-mb                              12288 MB
+  Largest container: memory                  yarn.scheduler.maximum-allocation-mb                              12288 MB = 12.00 GB
   Largest container: vcores                  yarn.scheduler.maximum-allocation-vcores                          4 (default)
-  Memory is rounded up to a multiple of      yarn.scheduler.minimum-allocation-mb                              32 MB
-  Memory per node for YARN (this host)       yarn.nodemanager.resource.memory-mb                               12288 MB
+  Memory is rounded up to a multiple of      yarn.scheduler.minimum-allocation-mb                              32 MB = 0.03 GB
+  Memory per node for YARN (this host)       yarn.nodemanager.resource.memory-mb                               12288 MB = 12.00 GB
   vcores per node for YARN (this host)       yarn.nodemanager.resource.cpu-vcores                              4
   Node labels on                             yarn.node-labels.enabled                                          false (default)
   Node label for ApplicationMasters          yarn.node-labels.am.default-node-label-expression                 not set
 
   /etc/hadoop/conf/capacity-scheduler.xml
   Containers are sized by                    yarn.scheduler.capacity.resource-calculator                       memory only (default)
-  AM pool of each queue (default)            yarn.scheduler.capacity.maximum-am-resource-percent               0.5 (50%)
+  AM pool of each queue (default)            yarn.scheduler.capacity.maximum-am-resource-percent               0.5 (50% of each queue)
   Most apps (running + waiting)              yarn.scheduler.capacity.maximum-applications                      10000 (default)
   Most running apps                          yarn.scheduler.capacity.max-parallel-apps                         not set
   Most running apps per service account      yarn.scheduler.capacity.user.max-parallel-apps                    not set
   Service accounts mapped to queues          yarn.scheduler.capacity.queue-mappings                            u:svc_spark:default,u:svc_reports:default,u:%user:%user
 
   Queue root.default
-  Guaranteed share of the parent             yarn.scheduler.capacity.root.default.capacity                     100%
-  Most share of the parent                   yarn.scheduler.capacity.root.default.maximum-capacity             100% (default)
+  Guaranteed share of the parent             yarn.scheduler.capacity.root.default.capacity                     100% (24.00 GB)
+  Most share of the parent                   yarn.scheduler.capacity.root.default.maximum-capacity             100% (default; 24.00 GB)
   State                                      yarn.scheduler.capacity.root.default.state                        RUNNING (default)
-  One service account: x guaranteed share    yarn.scheduler.capacity.root.default.user-limit-factor            1 (default)
-  Smallest share per active service account  yarn.scheduler.capacity.root.default.minimum-user-limit-percent   100% (default)
-  AM pool share                              yarn.scheduler.capacity.root.default.maximum-am-resource-percent  0.5 (cluster-wide value)
+  One service account: x guaranteed share    yarn.scheduler.capacity.root.default.user-limit-factor            1 (default; 24.00 GB = 1 × guaranteed 24.00 GB)
+  Smallest share per active service account  yarn.scheduler.capacity.root.default.minimum-user-limit-percent   100% (default; 24.00 GB of the guaranteed 24.00 GB)
+  AM pool share                              yarn.scheduler.capacity.root.default.maximum-am-resource-percent  0.5 (cluster-wide value; 50% of the queue: 12.00 GB)
   Largest container: memory                  yarn.scheduler.capacity.root.default.maximum-allocation-mb        cluster limit (default)
   Most running apps                          yarn.scheduler.capacity.root.default.max-parallel-apps            no limit (default)
   Service accounts mapped here               yarn.scheduler.capacity.queue-mappings                            svc_spark, svc_reports
@@ -1103,7 +1106,7 @@ and uses the one for all queues.
   /etc/spark/conf/spark-defaults.conf
   Deploy mode                                spark.submit.deployMode                                           client (default)
   Queue                                      spark.yarn.queue                                                  default (default)
-  Executor heap                              spark.executor.memory                                             4743M
+  Executor heap                              spark.executor.memory                                             4743M = 4.63 GB
   Executor heap (EMR default)                spark.emr.default.executor.memory                                 not set
   Executor overhead                          spark.executor.memoryOverhead                                     10% of heap, min 384 MB (default)
   Executor vcores                            spark.executor.cores                                              4
@@ -1114,11 +1117,11 @@ and uses the one for all queues.
   Fewest executors                           spark.dynamicAllocation.minExecutors                              0 (default)
   Most executors                             spark.dynamicAllocation.maxExecutors                              no limit (default)
   Executors (without dynamic allocation)     spark.executor.instances                                          2 (default)
-  Driver heap                                spark.driver.memory                                               2048M
-  AM heap in client mode                     spark.yarn.am.memory                                              512m (default)
+  Driver heap                                spark.driver.memory                                               2048M = 2.00 GB
+  AM heap in client mode                     spark.yarn.am.memory                                              512m = 0.50 GB (default)
 
   /etc/oozie/conf/oozie-site.xml
-  Launcher memory                            oozie.launcher.default.memory.mb                                  2048 MB (default)
+  Launcher memory                            oozie.launcher.default.memory.mb                                  2048 MB = 2.00 GB (default)
   Launcher vcores                            oozie.launcher.default.vcores                                     1 (default)
   Launcher queue                             oozie.launcher.default.queue                                      default
 
